@@ -121,6 +121,24 @@ def project_texels_to_image(tex_pos, right, up, ortho_scale):
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_verts(verts: torch.Tensor, norm_size: float = 1.15) -> torch.Tensor:
+    """
+    Two-pass centre-and-scale matching Blender's auto_center_and_scale.
+    Pass 1: centre on bounding-box midpoint, scale so max-radius * 2 == norm_size.
+    Pass 2: re-centre (floating-point drift) and refine scale.
+    """
+    for _ in range(2):
+        center = (verts.min(dim=0)[0] + verts.max(dim=0)[0]) * 0.5
+        verts  = verts - center
+        r      = torch.sqrt((verts ** 2).sum(dim=-1).max()).clamp(min=1e-6)
+        verts  = verts * (norm_size / (r * 2.0))
+    return verts
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -143,11 +161,73 @@ def texture_mesh_with_multiview(
     max_hole_size: int = 10,
     use_metallic: bool = True,
     depth_eps: float = 0.002,
-    low_poly_mesh: trimesh.Trimesh = None
+    low_poly_mesh: trimesh.Trimesh = None,
+    u_pixel_offset: float = 0.0,
+    v_pixel_offset: float = 0.0,
+    use_cylindrical_uv: bool = False,
+    saturation_boost: float = 1.0,
+    brightness_correction: float = 1.0,
+    debug_color = None,           # None → normal fix; (R,G,B) tuple → paint that colour instead
+    p1b_dark_thresh:        int   = 150,
+    p1b_sat_thresh:         int   = 55,
+    p1b_bright_fraction:    float = 0.6,   # relative mode: floor = median_sat_bright × fraction
+    p1b_bright_thresh:      int   = 180,   # absolute mode: fixed floor
+    p1b_relative_mode:      bool  = True,  # True = adaptive/relative, False = absolute
+    p1c_k:                  int   = 96,
+    p1c_iterations:         int   = 5,
+    p1c_frac:               float = 0.58,
+    p1c_diff:               int   = 18,
+    debug_regions:          bool  = False,  # replace texture with hair-region debug colour map
+    # Neck-region filter — suppress detected edges in the forward-facing neck zone.
+    neck_y_min:             float = 0.30,  # absolute world-Y bottom of neck zone
+    neck_y_max:             float = 0.42,  # absolute world-Y top of neck zone
+    # Cyan hairline edge filter
+    cyan_y_margin:          float = 0.45,  # floor = T_hair - margin*(T_hair-T_seam_floor)
+    cyan_z_frac:            float = 0.72,  # keep edges where Z < Z_max * this fraction
+    # Hair debug fill: when not None, paint detected hair pixels with this RGB colour.
+    # Use (255, 255, 255) as a white overlay to verify coverage before wiring up the
+    # actual hair colour from source images.
+    hair_debug_color = None,  # e.g. (255, 255, 0) for yellow; None = disabled
+    # Flat skin base colour — when not None, overrides ALL UV pixels with this
+    # solid colour before hair_debug_color is applied on top.  Use this to hide
+    # the projected skin texture while still evaluating hair coverage.
+    skin_base_color = None,   # e.g. (210, 180, 155); None = disabled
+    # KAN-9 — face-front weighting. When True, the face region (forward-facing,
+    # central, upper head) is painted from the SINGLE most-frontal view only;
+    # all other views are suppressed there so eyes/nose/mouth don't ghost from
+    # multi-view blending. Off by default → existing behaviour unchanged.
+    face_front_only: bool = True,
+    # KAN-9 — face landmark warp. When True, the front view's face is warped
+    # (478-pt TPS) so its features land on the mesh's per-feature, fixing the
+    # asymmetric misalignment a single global transform can't. Off by default.
+    face_landmark_warp: bool = False,
+    # KAN-9 debug — dump the UV atlas after each post-projection stage (projected,
+    # fill, dark-rescue, colour-consistency, final) to uv_transfer/_stage_*.png so
+    # we can see exactly which stage alters the face. Off by default.
+    dump_stages: bool = False,
+    # AUTO-FILL — DEFAULT OFF (user does NOT want any fabricated fill; it hides the
+    # real projection and makes the atlas a lie). When False, no cylindrical fill.
+    fast_skin_fill: bool = True,
+    # KAN-9 — skip depth-occlusion for texels facing the camera by more than this dot.
+    # A flat FRONT photo shows every front-facing texel; the depth/occlusion test was
+    # only needed for multi-view side projection and it false-rejected the curved torso
+    # (sternum/under-breast sit behind the breast tips). Grazing/side texels still use it.
+    front_skip_depth_dot: float = 0.35,
+    # KAN-9 — legacy heavy post-processing (3-D KD-tree fill of uncovered + dark-rescue
+    # + colour-consistency). DEFAULT OFF: the user wants the raw projection only, no
+    # fabricated fill and no dark-rescue (which previously flattened the face). With it
+    # off, uncovered texels simply keep the mesh's own (Trellis) base texture.
+    legacy_fill: bool = False,
+    # KAN-9 — feature-anchor warp. OFF (reverted to the known-good 84% baseline). The
+    # warp + reclaim experiments are inert; do not re-enable until reworked carefully.
+    feature_anchor_warp: bool = False,
+    # KAN-9 — global feature-offset. OFF: it's a pixel band-aid — a uniform shift that
+    # drags the WHOLE body to chase the features ("everything shifted"). The face is now
+    # aligned per-feature by the landmark warp instead. The residual nipple offset is mesh
+    # breast GEOMETRY (proven: a perfect chin->feet vertical scale still leaves nipples
+    # ~8px low), which no projection-space shift can fix — that's the remesh's job.
+    feature_offset: bool = True,    # auto uniform face+nipple alignment shift (convexity mesh anchors + delit photo)
 ):
-    if not (len(images) == len(azimuths) == len(elevations)):
-        raise ValueError("images, azimuths, and elevations must have the same length")
-        
     if not (len(images) == len(azimuths) == len(elevations)):
         raise ValueError("images, azimuths, and elevations must have the same length")
 
@@ -157,9 +237,7 @@ def texture_mesh_with_multiview(
         view_weights = [1.0] * num_views
 
     if len(view_weights) != num_views:
-        raise ValueError("view_weights must match number of images")        
-
-    num_views = len(images)
+        raise ValueError("view_weights must match number of images")
     print(f"[MultiView] {num_views} views | texture={texture_size} | ortho_scale={ortho_scale}")
 
     if low_poly_mesh is not None:
@@ -174,6 +252,18 @@ def texture_mesh_with_multiview(
     #faces = torch.from_numpy(mesh.faces).int().cuda()
     #vertices = mesh.vertices.cuda()
     #faces    = mesh.faces.cuda()
+
+    # If the mesh has ColorVisuals (e.g. loaded from a GLB with UV but no material),
+    # convert to TextureVisuals so mesh.visual.uv is accessible.
+    if hasattr(mesh, 'visual') and not (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
+        if hasattr(mesh.visual, 'to_texture'):
+            try:
+                tex_vis = mesh.visual.to_texture()
+                if hasattr(tex_vis, 'uv') and tex_vis.uv is not None:
+                    print('[MultiView] Converting ColorVisuals -> TextureVisuals')
+                    mesh.visual = tex_vis
+            except Exception as _e:
+                print(f'[MultiView] visual.to_texture() failed: {_e}')
 
     if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
         print('Mesh has UV')
@@ -217,38 +307,86 @@ def texture_mesh_with_multiview(
         del cumesh; gc.collect(); torch.cuda.empty_cache()
 
     # =========================================================================
-    # NEW: Replicate blender_render.py normalization
+    # Normalize mesh to match Blender's auto_center_and_scale
     # =========================================================================
-    # 1. Center the geometry (Blender does this in auto_center_and_scale)
-    bbox_min = out_verts.min(dim=0)[0]
-    bbox_max = out_verts.max(dim=0)[0]
-    center = (bbox_min + bbox_max) / 2.0
-    out_verts = out_verts - center
-
-    # 2. Scale to match Blender's norm_size
-    # Blender calculates Max Radius from the new center
-    current_max_radius = torch.sqrt((out_verts**2).sum(dim=-1).max())
-    norm_size = 1.15  # This must match --norm_size in blender_render.py
-    scale_user = current_max_radius * 2.0
-    scale_factor = norm_size / scale_user
-
-    out_verts = out_verts * scale_factor
+    out_verts   = _normalize_verts(out_verts, norm_size)
+    out_normals = out_normals / (out_normals.norm(dim=-1, keepdim=True) + 1e-8)
 
     print(f"[MultiView] Mesh: {out_verts.shape[0]} verts, {out_faces.shape[0]} faces")
     print(f"  X:[{out_verts[:,0].min():.3f},{out_verts[:,0].max():.3f}]"
           f"  Y:[{out_verts[:,1].min():.3f},{out_verts[:,1].max():.3f}]"
           f"  Z:[{out_verts[:,2].min():.3f},{out_verts[:,2].max():.3f}]")
 
-    # REPLICATE BLENDER NORMALIZATION
-    bbox_min = out_verts.min(dim=0)[0]
-    bbox_max = out_verts.max(dim=0)[0]
-    center = (bbox_min + bbox_max) / 2.0
-    out_verts = out_verts - center # Center at origin
+    # =========================================================================
+    # CYLINDRICAL UV OVERRIDE
+    # Replaces whatever UV was loaded/computed in STEP 1 with a clean
+    # cylindrical parametrisation derived from normalised vertex positions.
+    #
+    #   U = 0.5  → front of character (+Z, faces viewer at azimuth 0)
+    #   U = 0/1  → back of character (-Z, seam)
+    #   V = 0    → feet,  V = 1 → head
+    #
+    # Seam-crossing faces (back centreline) get their minority-side vertices
+    # duplicated and their U mirrored so nvdiffrast never sees a face that
+    # spans > 0.5 of the texture width.
+    #
+    # Forces blend_texture=False: diffusion texture lives in a different UV
+    # space so it cannot be composited here.
+    # =========================================================================
+    if use_cylindrical_uv:
+        print("[MultiView] Building cylindrical UV...")
+        xv, yv, zv = out_verts[:, 0], out_verts[:, 1], out_verts[:, 2]
 
-    current_max_radius = torch.sqrt((out_verts**2).sum(dim=-1).max())
-    scale_factor = norm_size / (current_max_radius * 2.0)
-    out_verts = out_verts * scale_factor # Scale to 1.15 units
-    out_normals = out_normals / (out_normals.norm(dim=-1, keepdim=True) + 1e-8)
+        u_cyl = (0.5 + torch.atan2(xv, zv) / (2.0 * math.pi)) % 1.0
+        y_lo, y_hi = yv.min(), yv.max()
+        v_cyl = (yv - y_lo) / (y_hi - y_lo + 1e-8)
+        out_uvs = torch.stack([u_cyl, v_cyl], dim=-1)   # (N, 2)
+
+        # ── Seam fix: duplicate vertices on minority side of seam faces ──────
+        face_u  = u_cyl[out_faces]                       # (F, 3)
+        u_span  = face_u.max(dim=1)[0] - face_u.min(dim=1)[0]
+        seam_mask = u_span > 0.5
+        n_seam  = int(seam_mask.sum().item())
+        print(f"  Cylindrical UV: {n_seam} seam-crossing faces → duplicating minority vertices")
+
+        if n_seam > 0:
+            new_faces = out_faces.clone()
+            extra_v, extra_n, extra_uv = [], [], []
+            dup_map = {}          # orig vertex idx → new vertex idx
+            n0 = out_verts.shape[0]
+
+            for fi in seam_mask.nonzero(as_tuple=True)[0]:
+                f   = out_faces[fi]
+                f_u = u_cyl[f]
+                n_low = int((f_u < 0.5).sum().item())
+
+                for i in range(3):
+                    vi   = int(f[i].item())
+                    vi_u = float(f_u[i].item())
+                    # Wrap the lone minority-side vertex to the opposite side
+                    needs_wrap = (n_low == 1 and vi_u <  0.5) or \
+                                 (n_low == 2 and vi_u >= 0.5)
+                    if needs_wrap:
+                        if vi not in dup_map:
+                            dup_map[vi] = n0 + len(extra_v)
+                            extra_v.append(out_verts[vi])
+                            extra_n.append(out_normals[vi])
+                            new_uv_val = out_uvs[vi].clone()
+                            new_uv_val[0] = 1.0 - vi_u   # mirror across seam
+                            extra_uv.append(new_uv_val)
+                        new_faces[fi, i] = dup_map[vi]
+
+            out_faces   = new_faces
+            if extra_v:
+                out_verts   = torch.cat([out_verts,   torch.stack(extra_v)])
+                out_normals = torch.cat([out_normals, torch.stack(extra_n)])
+                out_uvs     = torch.cat([out_uvs,     torch.stack(extra_uv)])
+                print(f"  Added {len(extra_v)} seam-duplicate vertices "
+                      f"({out_verts.shape[0]} total)")
+
+        blend_texture = False   # cylindrical UV ≠ diffusion UV space
+        print(f"  U=[{u_cyl.min():.3f},{u_cyl.max():.3f}]  "
+              f"V=[{v_cyl.min():.3f},{v_cyl.max():.3f}]")
 
     # --- STEP 2: UV RASTERIZATION ---
     ctx = dr.RasterizeCudaContext()
@@ -260,12 +398,99 @@ def texture_mesh_with_multiview(
     tex_normals = dr.interpolate(out_normals.unsqueeze(0), rast, out_faces.int())[0][0]
     tex_normals = tex_normals / (tex_normals.norm(dim=-1, keepdim=True) + 1e-8)
     tex_face_id = rast[0, :, :, 3].long() - 1
+    
+
+    # =========================================================================
+    # STEP 2b – Bake tangent-space normal map from mesh geometry
+    # =========================================================================
+    from .normal_map_utils import bake_normal_map
+    normalMapTexture = bake_normal_map(
+        out_verts, out_faces, out_uvs,
+        tex_normals, tex_face_id,
+        uv_hit_mask, texture_size,
+    )
 
     # --- STEP 3: VIEW PROJECTION ---
+    # debug_regions only needs UV geometry — skip the expensive projection loop.
+    _skip_projection = bool(debug_regions)
+    if _skip_projection:
+        print("[MultiView] debug_regions=True → skipping view projection + fill passes")
+
     acc_color  = torch.zeros(texture_size, texture_size, 3, device='cuda')
     acc_weight = torch.zeros(texture_size, texture_size, device='cuda')
 
-    for img, az, el, view_w in zip(images, azimuths, elevations, view_weights):
+    # =========================================================================
+    # KAN-9 — Face-front weight + front-view selection
+    # Build a soft per-texel weight (1 = face-front, 0 = elsewhere). In the loop
+    # below, every view EXCEPT the single most-frontal one is multiplied by
+    # (1 - face_weight), so the face is sourced from the front view only and the
+    # eyes/nose/mouth stop ghosting. Falls back to normal blending if no view is
+    # within the front window.
+    # =========================================================================
+    face_front_w_t  = None      # torch (H, W) in [0, 1]; None → feature disabled
+    _front_view_idx = -1
+    if face_front_only and not _skip_projection:
+        from .face_detection_utils import FaceDetectionUtils, is_front_view
+        _norm_az = [abs(((float(a) + 180.0) % 360.0) - 180.0) for a in azimuths]
+        _front_view_idx = int(np.argmin(_norm_az)) if _norm_az else -1
+        if _front_view_idx < 0 or not is_front_view(azimuths[_front_view_idx]):
+            _closest = azimuths[_front_view_idx] if _front_view_idx >= 0 else None
+            print(f"[FaceFront] no view within front window (closest az={_closest}) "
+                  f"— face weighting disabled this run")
+        else:
+            _fdu = FaceDetectionUtils(
+                texture_size   = texture_size,
+                uv_mask        = uv_hit_mask.cpu().numpy().astype(bool),
+                tex_pos_np     = tex_pos.cpu().numpy(),
+                tex_normals_np = tex_normals.cpu().numpy(),
+                neck_y_min     = neck_y_min,
+                neck_y_max     = neck_y_max,
+                # No hair_mask here: front-only paints fringe texels with the
+                # front view's own (hair) colour, and the seam-hair foundation
+                # reclaims hair texels afterward — so there's no skin over-paint.
+                hair_mask      = None,
+            )
+            face_front_w_t = torch.from_numpy(_fdu.get_face_front_weight()).cuda()
+            print(f"[FaceFront] enabled — front view idx={_front_view_idx} "
+                  f"(az={azimuths[_front_view_idx]})")
+
+    # =========================================================================
+    # KAN-9 — Face landmark warp (per-feature alignment, front view only)
+    # Render the mesh relief in front-image space, detect 478 FaceLandmarker points
+    # on relief + photo, build a TPS warp + soft face mask. Applied in the loop to
+    # the front view's sample coords so eyes/nose/mouth land on the mesh per-feature.
+    # =========================================================================
+    face_warp_field = None      # torch (1,2,H,W) target sample positions in px
+    face_mask_t     = None      # torch (1,1,H,W) soft weight
+    _warp_front_idx = -1
+    if face_landmark_warp and not _skip_projection:
+        _waz = [abs(((float(a) + 180.0) % 360.0) - 180.0) for a in azimuths]
+        _warp_front_idx = int(np.argmin(_waz)) if _waz else -1
+        if _warp_front_idx >= 0 and _waz[_warp_front_idx] <= 45.0:
+            try:
+                from .landmark_warp import compute_face_landmark_warp
+                _fimg = np.array(images[_warp_front_idx].convert('RGB')).astype(np.float32) / 255.0
+                _res = compute_face_landmark_warp(
+                    out_verts, out_faces.int(), out_normals, _fimg, ortho_scale, ctx)
+                if _res is not None:
+                    _wf, _fm = _res
+                    face_warp_field = _wf.permute(2, 0, 1).unsqueeze(0).contiguous()
+                    face_mask_t     = _fm.unsqueeze(0).unsqueeze(0).contiguous()
+                    print(f"[FaceWarp] enabled — front view idx={_warp_front_idx} "
+                          f"(az={azimuths[_warp_front_idx]})")
+            except Exception as _we:
+                print(f"[FaceWarp] failed ({_we!r}) — projecting without warp")
+        else:
+            print(f"[FaceWarp] no front-facing view (closest az="
+                  f"{azimuths[_warp_front_idx] if _warp_front_idx>=0 else None}) — disabled")
+
+    _anchor_field = None   # KAN-9 feature-anchor warp field (computed once, front view)
+    _anchor_view  = -1
+    _g_offset = None       # KAN-9 global feature-offset (dx,dy), computed once, front view
+    _g_offset_view = -1
+    for _view_i, (img, az, el, view_w) in (
+            enumerate(zip(images, azimuths, elevations, view_weights))
+            if not _skip_projection else []):
         img_np = np.array(img.convert('RGB')).astype(np.float32) / 255.0
         img_h, img_w = img_np.shape[:2]
 
@@ -309,7 +534,13 @@ def texture_mesh_with_multiview(
         
         cam_rast, _ = dr.rasterize(ctx, cam_clip, out_faces.int(), resolution=[occ_res, occ_res])
         cam_hit = cam_rast[0, :, :, 3] > 0
-        cam_hit_img = cam_hit.float().unsqueeze(0).unsqueeze(0)
+
+        # Dilate the silhouette by a few pixels so thin features (legs, fingers,
+        # hair) don't get dropped by bilinear sampling at the raster boundary.
+        cam_hit_np_dil = cam_hit.cpu().numpy().astype(np.uint8)
+        cam_hit_np_dil = cv2.dilate(cam_hit_np_dil, np.ones((5, 5), np.uint8), iterations=2)
+        cam_hit_dilated = torch.from_numpy(cam_hit_np_dil).bool().cuda()
+        cam_hit_img = cam_hit_dilated.float().unsqueeze(0).unsqueeze(0)
 
         # depth buffer
         cam_depth = dr.interpolate(
@@ -333,7 +564,6 @@ def texture_mesh_with_multiview(
         mesh_v_min = cam_clip_verts[:, 1].min()
         mesh_v_max = cam_clip_verts[:, 1].max()
 
-        mesh_u_span = (mesh_u_max - mesh_u_min).clamp(min=1e-6)
         mesh_v_span = (mesh_v_max - mesh_v_min).clamp(min=1e-6)
 
         # Find character bounds in image using the foreground mask
@@ -345,20 +575,125 @@ def texture_mesh_with_multiview(
             y_min, x_min = 0, 0
             y_max, x_max = img_h - 1, img_w - 1
 
-        u_norm = (u_clip - mesh_u_min) / mesh_u_span
-        x_pixel = u_norm * float(x_max - x_min + 1) + float(x_min) - 0.5
-        u_samp = ((x_pixel + 0.5) / float(img_w)) * 2.0 - 1.0
+        # ── Auto-alignment: centre + uniform height-based scale ───────────────
+        # Scale: derived from foreground character height (most stable axis).
+        img_char_h  = float(y_max - y_min + 1)
 
-        v_norm = (v_clip - mesh_v_min) / mesh_v_span
-        y_pixel = (1.0 - v_norm) * float(y_max - y_min + 1) + float(y_min) - 0.5
-        v_samp = ((y_pixel + 0.5) / float(img_h)) * 2.0 - 1.0
+        # X: foreground centroid — tracks the character's horizontal position in
+        #    each SV3D frame independently (character may not be image-centred).
+        # Y: bounding-box midpoint — aligns the mesh top/bottom to the character's
+        #    actual top/bottom in the image, eliminating per-view vertical drift
+        #    without needing manual v_pixel_offset tuning per character/view.
+        #    (Using image-centre here was the old behaviour that caused the drift.)
+        img_char_cx = float(coords[:, 1].mean())            # centroid x
+        img_char_cy = float(y_min + y_max) / 2.0           # bbox midpoint y
 
-        # Prevent grid_sample from touching the border texel
+        mesh_cx = float((mesh_u_min + mesh_u_max) * 0.5)  # mesh clip-space centre-x
+        mesh_cy = float((mesh_v_min + mesh_v_max) * 0.5)  # mesh clip-space centre-y
+
+        # Single uniform scale derived from character height
+        pix_per_clip = img_char_h / float(mesh_v_span)
+
+        print(f"    [align az={az:.0f}] img_centre=({img_char_cx:.1f},{img_char_cy:.1f}) "
+              f"char_h={img_char_h:.0f}px  pix/clip={pix_per_clip:.1f}")
+
+        # v_clip positive = up in world = smaller y in image (origin top-left)
+        x_pixel = img_char_cx + (u_clip - mesh_cx) * pix_per_clip + u_pixel_offset
+        y_pixel = img_char_cy - (v_clip - mesh_cy) * pix_per_clip + v_pixel_offset
+
+        # Heuristic (pre-offset) sample coords. The face-landmark warp field is built in
+        # THIS space (the relief is rendered without the body offset), so the warp must be
+        # indexed here — not after the body offset shifts x/y, which would mis-look-up the
+        # field by the offset amount. Lets the body-offset (below) and face-warp compose.
+        _xpix_heur = x_pixel
+        _ypix_heur = y_pixel
+
+        # KAN-9 — GLOBAL FEATURE-OFFSET (auto, bounded): one uniform (dx,dy) shift so the
+        # mesh's face+nipple anchors land on the photo's. Uniform-only: cannot distort the
+        # body outline or smear/tear the atlas (a scale would, by extrapolating to the legs).
+        # Computed once on the front-most view.
+        if feature_offset and (_g_offset is None) and abs(((az + 180.0) % 360.0) - 180.0) <= 45.0:
+            try:
+                from .feature_anchor_warp import compute_region_offsets
+                _r = compute_region_offsets(out_verts, out_normals, img_np,
+                                            img_char_cx, img_char_cy, pix_per_clip,
+                                            mesh_cx, mesh_cy, ortho_scale)
+                _g_offset = (0.0, 0.0) if _r is None else _r
+                # NOTE: no blanket sanity guard here any more — it discarded the GOOD face offset
+                # whenever the body one was bad (face stayed shifted). compute_region_offsets now
+                # self-validates per anchor (L/R consistency + body-differential clamp to the face).
+                _g_offset_view = _view_i
+            except Exception as _ge:
+                print(f"[FeatureOffset] failed ({_ge!r})"); _g_offset = (0.0, 0.0)
+        if feature_offset and (_g_offset is not None) and _view_i == _g_offset_view:
+            if isinstance(_g_offset, tuple) and len(_g_offset) == 4:
+                # height-blended: head→face_off, torso→body_off, smoothstep across the neck
+                (_fdx, _fdy), (_bdx, _bdy), _ylo, _yhi = _g_offset
+                _ymn = out_verts[:, 1].min(); _yrng = (out_verts[:, 1].max() - _ymn).clamp(min=1e-9)
+                _hn = ((tex_pos[..., 1] - _ymn) / _yrng)                  # per-texel height [0,1]
+                _w = ((_hn - _ylo) / max(_yhi - _ylo, 1e-6)).clamp(0.0, 1.0)
+                _w = _w * _w * (3.0 - 2.0 * _w)                           # smoothstep
+                x_pixel = x_pixel + _bdx + (_fdx - _bdx) * _w
+                y_pixel = y_pixel + _bdy + (_fdy - _bdy) * _w
+            else:
+                x_pixel = x_pixel + _g_offset[0]
+                y_pixel = y_pixel + _g_offset[1]
+
+        # KAN-9 — face landmark warp (front view only): inside the soft face mask,
+        # bend each texel's sample position from the mesh-feature location to the
+        # photo-feature location (TPS over 478 MediaPipe landmarks). Fixes per-
+        # feature / asymmetric face misalignment that no global transform can.
+        if face_warp_field is not None and _view_i == _warp_front_idx:
+            _gx = (_xpix_heur / float(img_w - 1)) * 2.0 - 1.0   # index in heuristic space
+            _gy = (_ypix_heur / float(img_h - 1)) * 2.0 - 1.0   # (pre body-offset)
+            _grid = torch.stack([_gx, _gy], dim=-1).unsqueeze(0)
+            _tgt = F.grid_sample(face_warp_field, _grid, mode='bilinear',
+                                 padding_mode='border', align_corners=True)[0]   # (2,H,W)
+            _fw = F.grid_sample(face_mask_t, _grid, mode='bilinear',
+                                padding_mode='zeros', align_corners=True)[0, 0]   # (H,W)
+            x_pixel = x_pixel * (1.0 - _fw) + _tgt[0] * _fw
+            y_pixel = y_pixel * (1.0 - _fw) + _tgt[1] * _fw
+
+        # KAN-9 — FEATURE-ANCHOR WARP (automatic, scalable): build a sparse thin-plate
+        # spline that maps the mesh's face-centre + breast-tips onto the photo's detected
+        # face + nipples (corners pinned), then bend every sample coord through it so
+        # those features land exactly. Corrects breasts-too-high / face-shift per
+        # character with no manual numbers. Computed once on the front-most view.
+        if feature_anchor_warp and (_anchor_field is None) and abs(((az + 180.0) % 360.0) - 180.0) <= 45.0:
+            try:
+                from .feature_anchor_warp import compute_feature_anchor_warp
+                _anchor_field = compute_feature_anchor_warp(
+                    out_verts, out_normals, img_np,
+                    img_char_cx, img_char_cy, pix_per_clip, mesh_cx, mesh_cy, ortho_scale)
+                _anchor_view = _view_i
+            except Exception as _awe:
+                print(f"[AnchorWarp] failed ({_awe!r}) — projecting without anchor warp")
+                _anchor_field = None
+        if feature_anchor_warp and (_anchor_field is not None) and _view_i == _anchor_view:
+            _af = _anchor_field.permute(2, 0, 1).unsqueeze(0).contiguous()
+            _gx = (x_pixel / float(img_w - 1)) * 2.0 - 1.0
+            _gy = (y_pixel / float(img_h - 1)) * 2.0 - 1.0
+            _grid = torch.stack([_gx, _gy], dim=-1).unsqueeze(0)
+            _tw = F.grid_sample(_af, _grid, mode='bilinear', padding_mode='border', align_corners=True)[0]
+            x_pixel = _tw[0]; y_pixel = _tw[1]
+
+        u_samp_raw = ((x_pixel + 0.5) / float(img_w)) * 2.0 - 1.0
+        v_samp_raw = ((y_pixel + 0.5) / float(img_h)) * 2.0 - 1.0
+
+        # in_bounds MUST be checked on the raw (unclamped) coordinates.
+        # If we check after clamping, every pixel appears "in bounds" and
+        # T-pose arm UV texels that project far outside the source image silently
+        # sample the dark border pixel → the entire arm gets dark color baked in
+        # as "covered" and the 3-D fill never fixes it.
+        in_bounds = (u_samp_raw.abs() <= 1.0) & (v_samp_raw.abs() <= 1.0)
+
+        # Clamp only for grid_sample (which requires coords in [-1,1])
         eps = 1e-4
-        u_samp = u_samp.clamp(-1 + eps, 1 - eps)
-        v_samp = v_samp.clamp(-1 + eps, 1 - eps)
+        u_samp = u_samp_raw.clamp(-1 + eps, 1 - eps)
+        v_samp = v_samp_raw.clamp(-1 + eps, 1 - eps)
 
-        # Occlusion check
+        # Occlusion check — use a low threshold because the silhouette was dilated;
+        # 0.05 retains all genuine hits while still rejecting clear background.
         grid_occ = torch.stack([u_clip, v_clip], dim=-1).unsqueeze(0)
         sampled_hit = F.grid_sample(
             cam_hit_img,
@@ -366,8 +701,8 @@ def texture_mesh_with_multiview(
             mode='bilinear',
             padding_mode='zeros',
             align_corners=False
-        )[0, 0] > 0.25
-        
+        )[0, 0] > 0.05
+
         sampled_depth = F.grid_sample(
             cam_depth_occ,
             grid_occ,
@@ -379,17 +714,80 @@ def texture_mesh_with_multiview(
         tex_depth = -(tex_pos * look).sum(-1)
 
         depth_match = tex_depth >= sampled_depth - depth_eps
-        
-        # Visibility Mask
-        in_bounds = (u_samp.abs() <= 1.0) & (v_samp.abs() <= 1.0)
-        visible = uv_hit_mask & in_bounds & sampled_hit & depth_match
 
-        # Weighting and Accumulation
+        # Foreground check: reject texels that project onto the image background.
+        # Use the DILATED foreground mask (not the raw one) so that soft edges
+        # in SV3D-generated frames don't create dark halos at island boundaries.
+        fg_mask_t    = torch.from_numpy(dilated_fg.astype(np.float32)).cuda().unsqueeze(0).unsqueeze(0)
+        grid_fg      = torch.stack([u_samp, v_samp], dim=-1).unsqueeze(0)
+        sampled_fg   = F.grid_sample(
+            fg_mask_t, grid_fg, mode='bilinear', padding_mode='zeros', align_corners=False
+        )[0, 0] > 0.5
+
+        # Sample colours first so we can check brightness before marking visible
         grid_col = torch.stack([u_samp, v_samp], dim=-1).unsqueeze(0)
         sampled_colors = F.grid_sample(img_t, grid_col, mode='bilinear', padding_mode='border', align_corners=False)[0].permute(1, 2, 0)
-        
-        dot = (tex_normals * (-look)).sum(-1).clamp(min=0.0) ** 1.5
+
+        # Reject very dark pixels (shadows / background bleed) – let KD-tree fill
+        # propagate correct skin colour instead of projecting a near-black value.
+        brightness = sampled_colors.mean(dim=-1)   # [H_tex, W_tex], range [0,1]
+        bright_enough = brightness > 0.08
+
+        # Reject grazing-angle projections.  Surfaces whose normal is nearly
+        # perpendicular to this camera (dot < MIN_DOT) should not receive a
+        # colour from this view – they'll be filled later by the KD-tree from
+        # a well-projected neighbour.  Arm tops (normal≈+Y) have dot=0 with
+        # any horizontal camera, so they are always excluded here and left truly
+        # uncovered, allowing KD-tree to propagate correct skin from arm sides.
+        dot_raw = (tex_normals * (-look)).sum(-1)          # signed, no clamp yet
+
+        # Per-view minimum dot threshold — auto-scaled from elevation angle.
+        #
+        # Horizontal views (el=0):  min_dot = 0.12 (unchanged).
+        # Top-down view  (el=90):   min_dot = 0.50 — only surfaces within ~60° of
+        #   straight-up get the top-view projection.  Without this, any back or side
+        #   surface that tilts even slightly upward (dot≈0.15) gets painted with
+        #   whatever the Trellis texture looks like from above, which includes hair
+        #   shadows and wrong-angle colour bleeding onto the upper back.
+        # Intermediate (e.g. el=30): min_dot ≈ max(0.12, sin(30°)×0.55) ≈ 0.28.
+        el_rad       = math.radians(el)
+        view_min_dot = max(0.12, abs(math.sin(el_rad)) * 0.55)
+        good_angle   = dot_raw > view_min_dot
+
+        # KAN-9 — a flat FRONT photo shows every front-facing texel, but the
+        # depth/occlusion test (designed for multi-view side projection) false-rejects
+        # the curved torso: the sternum / under-breast skin sits a little behind the
+        # breast tips and gets flagged "self-occluded". Skip depth for texels that
+        # clearly face this camera (they can't be a hidden/back surface); keep it for
+        # grazing/side texels. Fixes the missing chest with no back-leak.
+        depth_ok = depth_match | (dot_raw > front_skip_depth_dot)
+
+        # Visibility Mask
+        visible = uv_hit_mask & in_bounds & sampled_hit & depth_ok & sampled_fg & bright_enough & good_angle
+
+        # KAN-9 — per-mask coverage diagnostic on the REAL bake mesh (the offline
+        # reproduction kept disagreeing with the bake; this prints the ground truth).
+        try:
+            _ff = uv_hit_mask & (dot_raw > 0.12)
+            _n  = int(_ff.sum().item())
+            if _n > 0:
+                _p = lambda m: 100.0 * int((_ff & m).sum().item()) / _n
+                print(f"[CoverageDiag az={az:.0f}] front-facing={_n}  "
+                      f"inbounds={_p(in_bounds):.0f}% occ={_p(sampled_hit):.0f}% "
+                      f"depth={_p(depth_ok):.0f}% fg={_p(sampled_fg):.0f}% "
+                      f"bright={_p(bright_enough):.0f}% angle={_p(good_angle):.0f}%  "
+                      f"=> COVERED={_p(visible):.0f}%")
+        except Exception as _cde:
+            print(f"[CoverageDiag] skipped: {_cde!r}")
+
+        dot = dot_raw.clamp(min=0.0) ** 1.5
         weights = (dot ** blend_exponent) * visible.float() * view_w
+
+        # KAN-9 — in the face region, keep ONLY the front view: every other view's
+        # weight is faded out by (1 - face_weight) so it cannot contribute colour
+        # to eyes/nose/mouth. The front view keeps its full weight.
+        if face_front_w_t is not None and _view_i != _front_view_idx:
+            weights = weights * (1.0 - face_front_w_t)
 
         acc_color += sampled_colors * weights.unsqueeze(-1)
         acc_weight += weights
@@ -456,16 +854,34 @@ def texture_mesh_with_multiview(
         existing_rgb = torch.from_numpy(existing_np[..., :3]).cuda()        # (H, W, 3)
         existing_alpha = torch.from_numpy(existing_np[..., 3:4]).cuda()     # (H, W, 1)
 
-        # Hard composite: where the projection covered a texel, use the projected
-        # color fully. Where it didn't, keep the original texture untouched.
-        # The normal-based weighting already handles per-view confidence during
-        # accumulation, so no additional blending factor is needed here.
+        # Luminance-gated composite:
+        #   - Where projection is bright (not a dark edge artifact) AND confident:
+        #     use projected color (accurate front-image colours).
+        #   - Where projection is dark (sampled background / silhouette edge):
+        #     defer entirely to the diffusion base texture.
+        #   - Where projection has no coverage: use diffusion base.
+        #
+        # This prevents dark edge samples from overwriting good diffusion skin tones.
+        proj_lum = (0.299 * projected_color[..., 0]
+                  + 0.587 * projected_color[..., 1]
+                  + 0.114 * projected_color[..., 2])          # (H,W) in [0,1]
+        exist_lum = (0.299 * existing_rgb[..., 0]
+                   + 0.587 * existing_rgb[..., 1]
+                   + 0.114 * existing_rgb[..., 2])
+
+        # Gate: projection must be at least 50% as bright as the diffusion base
+        # (prevents near-black edge samples from dominating).
+        bright_gate = (proj_lum > 0.05) & (proj_lum >= exist_lum * 0.5)
+        bright_gate3 = bright_gate.unsqueeze(-1).float()
+
+        gated_conf3 = confidence3 * bright_gate3
+
         blended_rgb = (
-            projected_color * confidence3 +
-            existing_rgb * (1.0 - confidence3)
+            projected_color * gated_conf3 +
+            existing_rgb   * (1.0 - gated_conf3)
         )
 
-        composite_mask = confidence > 0.01
+        composite_mask = (confidence > 0.01) & bright_gate
 
         color_np = (blended_rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         # Preserve the original alpha everywhere (mesh already has full coverage)
@@ -482,59 +898,464 @@ def texture_mesh_with_multiview(
             "outputting projection-only texture (holes will be transparent)."
         )
 
-        # RGB from projection
+        # RGB from projection — back-facing areas (projected_color=0) will be
+        # overwritten by the nearest-neighbour fill below.
         color_np = (projected_color.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
 
-        # Alpha from projection confidence
-        conf_np = confidence.cpu().numpy()
+        # Alpha: fully opaque for every projected pixel; the fill pass will
+        # set alpha=255 for back-facing areas too.  The final texture is opaque
+        # everywhere inside the UV islands (alphaMode='OPAQUE' in the material).
+        alpha_np = np.where(valid_mask.cpu().numpy(), np.uint8(255), np.uint8(0))
 
-        # Slight threshold to remove noise
-        alpha_mask = conf_np > 0.01
+    # =========================================================================
+    # FILL – delegated to FillUtils
+    # =========================================================================
+    from .fill_utils import FillUtils
 
-        alpha_np = (conf_np * 255).clip(0, 255).astype(np.uint8)
-        alpha_np[~alpha_mask] = 0
+    uv_mask_np_bool = uv_hit_mask.cpu().numpy().astype(bool)
+    covered         = valid_mask.cpu().numpy()
+    uncovered_uv    = uv_mask_np_bool & ~covered
 
-    if fill_holes:
-        print('Filling holes and padding UV seams ...')
-        
-        # Get numpy arrays
-        uv_mask_np = uv_hit_mask.cpu().numpy().astype(np.uint8)
-        valid_mask_np = valid_mask.cpu().numpy().astype(np.uint8)
-        
-        # 1. INTERNAL HOLES: Pixels inside the UV map that didn't get colored
-        internal_hole_mask = cv2.bitwise_and(cv2.bitwise_not(valid_mask_np), uv_mask_np)
-        
-        if max_hole_size > 0:
-            # Filter internal holes by size to avoid filling massive intentional gaps
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(internal_hole_mask, connectivity=8)
-            areas = stats[:, cv2.CC_STAT_AREA]
-            valid_labels_mask = (areas <= max_hole_size)
-            valid_labels_mask[0] = False  # Ignore background
-            filtered_internal_holes = valid_labels_mask[labels].astype(np.uint8)
+    tex_pos_np = tex_pos.cpu().numpy()
+    fu = FillUtils(uv_mask_np_bool, tex_pos_np)
+
+    # ── [AtlasDiag] ROOT-CAUSE instrumentation: how the 4096 atlas area is split across UV
+    # islands, with each island's 3-D centre (paint space: X=lat, Y=height, Z=depth) so we can
+    # see whether the BODY island is being squeezed while hair/genital/face hog the atlas, and
+    # whether the covered (real-projected) fraction is healthy. Compare a GOOD vs BAD bake.
+    try:
+        from scipy.ndimage import label as _ad_label
+        _ad_lab, _ad_n = _ad_label(uv_mask_np_bool)
+        _ad_sz = np.bincount(_ad_lab.ravel())
+        _ad_tot = int(uv_mask_np_bool.sum())
+        _ad_cov = int((uv_mask_np_bool & covered).sum())
+        print(f"[AtlasDiag] uv_hit={_ad_tot:,} ({100.0*_ad_tot/uv_mask_np_bool.size:.1f}% of atlas)  "
+              f"covered(real-projected)={_ad_cov:,} ({100.0*_ad_cov/max(_ad_tot,1):.1f}% of uv_hit)  islands={_ad_n}")
+        _ad_order = (np.argsort(_ad_sz[1:])[::-1] + 1) if _ad_n > 0 else []
+        for _ad_li in _ad_order[:8]:
+            _ad_m = (_ad_lab == _ad_li)
+            _ad_c = tex_pos_np[_ad_m].mean(0)
+            _ad_cf = 100.0 * int((_ad_m & covered).sum()) / max(int(_ad_m.sum()), 1)
+            print(f"   island {int(_ad_li):3d}: {int(_ad_sz[_ad_li]):8,d} tex "
+                  f"({100.0*_ad_sz[_ad_li]/max(_ad_tot,1):4.1f}% of uv_hit, covered {_ad_cf:3.0f}%)  "
+                  f"centre x={_ad_c[0]:+.2f} y={_ad_c[1]:+.2f} z={_ad_c[2]:+.2f}")
+    except Exception as _ade:
+        print(f"[AtlasDiag] skipped: {_ade!r}")
+
+    # ── SEAM-DRIVEN HAIR FOUNDATION (KAN-8) ───────────────────────────────────
+    # Use the hair region from gen_seams (the seam we tuned) as the hair mask so the
+    # seam work drives the colour.  Map gen_seams' per-tri hair flag (_genseams_viz
+    # .npz, its NORMALIZED space) onto the paint's texels by nearest centroid --
+    # normalize the paint's tex_pos the same way gen_seams normalizes (own bbox).
+    seam_hair_mask = None
+    try:
+        from scipy.spatial import cKDTree as _cKDT
+        from .hair_detection_utils_v2 import HairDetectionUtils
+        _vz = np.load(r'C:\applications\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\ComfyUI\uv_transfer\_genseams_viz.npz')
+        _vco = _vz['co'].astype(np.float64); _vtris = _vz['tris']; _vth = _vz['tris_hair'].astype(bool)
+        _vtc = _vco[_vtris].mean(axis=1)
+        _ov = out_verts.detach().cpu().numpy().astype(np.float64)
+        _of = out_faces.detach().cpu().numpy()
+        # AXIS: the paint mesh is Y-up (Y=height, Z=depth); gen_seams is Z-up.  Map the
+        # paint mesh into gen's normalized space the same way gen_seams normalized.
+        _hmn, _hmx = float(_ov[:, 1].min()), float(_ov[:, 1].max())   # height = paint Y
+        _lmn, _lmx = float(_ov[:, 0].min()), float(_ov[:, 0].max())   # lateral = paint X
+        _zs = 0.91 / (_hmx - _hmn); _zo = -0.41 - _hmn * _zs
+        _xs = 0.92 / (_lmx - _lmn); _xc = (_lmn + _lmx) / 2.0
+        # PER-FACE hair, NOT per-texel: map each paint FACE centroid to the nearest gen
+        # tri.  tex_pos is garbage for back-facing texels (the unseen crown/back of the
+        # head), which silently dropped them; per-face + rasterize can't drop them.
+        _pfc = _ov[_of].mean(axis=1)
+        _pfn = np.empty_like(_pfc)
+        _pfn[:, 0] = (_pfc[:, 0] - _xc) * _xs    # gen lateral
+        _pfn[:, 1] = -_pfc[:, 2] * _zs           # gen depth (Y-up -> Z-up flip)
+        _pfn[:, 2] = _pfc[:, 1] * _zs + _zo      # gen height
+        _, _fi = _cKDT(_vtc).query(_pfn, k=1, workers=-1)
+        _facehair = _vth[_fi] & (np.abs(_pfc[:, 0]) < 0.20)   # guard: never the arms
+        # rasterize the hair FACES straight into the atlas (fill their UV triangles)
+        _hdu_ear = HairDetectionUtils(
+            texture_size=texture_size, uv_mask=uv_mask_np_bool, tex_pos_np=tex_pos_np,
+            tex_normals_np=tex_normals.cpu().numpy(),
+            neck_y_min=neck_y_min, neck_y_max=neck_y_max,
+            cyan_y_margin=cyan_y_margin, cyan_z_frac=cyan_z_frac, trimesh=mesh,
+            _norm_verts=_ov, _norm_faces=_of, _norm_uvs=out_uvs.detach().cpu().numpy())
+        seam_hair_mask = _hdu_ear._rasterize_face_mask(_facehair, dilate_px=1)
+        if seam_hair_mask is None:
+            seam_hair_mask = np.zeros_like(uv_mask_np_bool)
+        seam_hair_mask &= uv_mask_np_bool
+        print(f"[SeamHair] {int(_facehair.sum()):,} hair faces -> {int(seam_hair_mask.sum()):,} texels (per-face rasterised, tex_pos-free)")
+        # (#1) remove EARS (the rasterized hair can still cover the thin ear)
+        try:
+            _Tear = _hdu_ear._compute_thresholds()
+            _earf = _hdu_ear._detect_ear_faces(_Tear)
+            if _earf is not None and _earf.any():
+                _earuv = _hdu_ear._rasterize_face_mask(_earf, dilate_px=2)
+                if _earuv is not None:
+                    _nb = int(seam_hair_mask.sum()); seam_hair_mask &= ~_earuv
+                    print(f"[SeamHair] -ears: {_nb} -> {int(seam_hair_mask.sum())} (ear px {int(_earuv.sum()):,})")
+        except Exception as _ee:
+            print(f"[SeamHair] ear removal skipped: {_ee!r}")
+        # ── KAN-9: RECLAIM THE FACE from the hair mis-flag ────────────────────
+        # gen_seams over-flags the FRONT of the face (forehead/eyes/nose/cheeks) as
+        # hair, so the face gets hair treatment + the FBX Hair material -> "no face".
+        # The true face skin = faces above the neck, facing the camera, on the front
+        # half.  Pull them out of the hair mask AND write the set so the FBX exporter
+        # excludes them from the Hair material too.  Real hair is untouched: the scalp
+        # points up (normal_z low), sides/back point away (front half / normal_z fail).
+        try:
+            _ovf = out_verts.detach().cpu().numpy(); _off = out_faces.detach().cpu().numpy()
+            _onf = out_normals.detach().cpu().numpy()
+            _fcen = _ovf[_off].mean(axis=1)
+            _fnrm = _onf[_off].mean(axis=1)
+            _fnz  = _fnrm[:, 2] / (np.linalg.norm(_fnrm, axis=1) + 1e-8)
+            # ROBUST face region via MediaPipe (recognises the real face on ANY character and
+            # distinguishes face from hairline) — replaces the fragile per-character angle
+            # guard that let curved faces slip through and be flagged as hair. Falls back to
+            # the geometric guard only if the detector can't find a face on the relief.
+            _faceskin = None
+            try:
+                from .landmark_warp import compute_face_region_faces
+                _wfi = int(np.argmin([abs(((float(_a) + 180.0) % 360.0) - 180.0) for _a in azimuths]))
+                _ffi = np.array(images[_wfi].convert('RGB')).astype(np.float32) / 255.0
+                _faceskin = compute_face_region_faces(out_verts, out_faces.int(), out_normals, _ffi, ortho_scale, ctx)
+            except Exception as _fre:
+                print(f"[FaceSkin] MediaPipe face region failed ({_fre!r}) — geometric fallback")
+            if _faceskin is None:
+                _faceskin = (_fnz > 0.35) & (_fcen[:, 2] > 0.0) & (_fcen[:, 1] > float(neck_y_min))
+            np.save(r'C:\applications\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable'
+                    r'\ComfyUI\uv_transfer\last_seams_faceskin.npy', _faceskin)
+            _fsuv = _hdu_ear._rasterize_face_mask(_faceskin, dilate_px=1)
+            if _fsuv is not None:
+                _nb = int(seam_hair_mask.sum()); seam_hair_mask &= ~_fsuv
+                print(f"[SeamHair] -face skin reclaimed (hair mis-flag): {_nb} -> {int(seam_hair_mask.sum())}")
+            print(f"[FaceSkin] {int(_faceskin.sum())} front-face faces reclaimed from hair "
+                  f"-> last_seams_faceskin.npy")
+        except Exception as _fse:
+            print(f"[FaceSkin] reclaim skipped: {_fse!r}")
+    except Exception as _se:
+        print(f"[SeamHair] failed ({_se!r}) — no seam-hair foundation this run")
+        import traceback as _tb; _tb.print_exc()
+
+    def _dump_stage(_tag):
+        if not dump_stages:
+            return
+        try:
+            from PIL import Image as _PImg
+            import os as _os
+            _p = _os.path.join(r'C:\applications\ComfyUI_windows_portable_nvidia'
+                               r'\ComfyUI_windows_portable\ComfyUI\uv_transfer',
+                               '_stage_' + _tag + '.png')
+            _PImg.fromarray(color_np).save(_p)
+            print(f"[DumpStage] {_tag} -> {_os.path.basename(_p)}")
+        except Exception as _de:
+            print(f"[DumpStage] {_tag} failed: {_de!r}")
+
+    _dump_stage('0_projected')
+    if (not _skip_projection) and fast_skin_fill:
+        # ── CYLINDRICAL FILL (front-only): keep the projected front; fill every
+        # uncovered (back/side) texel by interpolating the two still-visible
+        # silhouette-edge colours AROUND the body, per height band.  Photo-derived,
+        # smooth, height-varying skin — NOT a flat slab.  Skips the 3-D KD-tree
+        # fill, dark-rescue and colour-consistency (the ~2-3 min cost, and the
+        # dark-rescue that flattened the face).  Hair = its own FBX material.
+        # NOTE: a global erode of `covered` (border-margin idea) was REVERTED — it also grows the
+        # INTERNAL coverage holes (curved chest false-rejected by the depth test) into front patches.
+        # The border-margin must only nibble the TRUE OUTER grazing edge, not internal holes (TODO).
+        # Body: cylindrical wrap (hair OFF — the wrap assumes a cylinder and grabbed the body
+        # silhouette on the drape -> skin-toned back hair). Hair gets its own 3-D fill below.
+        fu.fill_cylindrical(color_np, alpha_np, covered, region_mask=seam_hair_mask, fill_hair=False)
+        _dump_stage('1_cylindrical_fill')
+        # HAIR: keep the front image for visible hair; ONLY fill the hair we cannot see, from the
+        # nearest VISIBLE hair in 3-D (unseen back/sides take the nearby front-hair colour).
+        fu.fill_hair_3d(color_np, alpha_np, covered, seam_hair_mask)
+        _dump_stage('1b_hair_fill')
+        # ARM WRAP (user's option 1): wrap the reliable front-arm colour over the whole arm
+        # so the browner/darker top+back take the good front tone. GEOMETRY-targeted to the
+        # lateral arm region (|x|>0.30) only -> cannot touch the breast/torso, and stable
+        # across per-bake meshes (no colour thresholds — the thing that broke the breast).
+        fu.wrap_arm_front(color_np)
+        _dump_stage('2_arm_wrap')
+        # SEAM STITCH disabled — reverted to the known-good arm-wrap-only state while we
+        # diagnose the upstream UV-unwrap collapse (atlas progressively emptying across
+        # bakes). stitch_seams only recolours existing texels, so it is not the cause; kept
+        # in fill_utils for when the unwrap is stable again.
+        # fu.stitch_seams(color_np, debug=bool(int(_os_st.environ.get('STITCH_DEBUG', '1'))))
+        # Other per-texel detect-replace passes stay DISABLED (over-caught the breast on a
+        # different per-bake mesh). Seams are fixed at the SOURCE in gen_seams instead.
+        # fu.recolor_seam_borders(color_np)
+        # fu.replace_clear_borders(color_np)
+    elif (not _skip_projection) and legacy_fill:
+        fu.fill_uncovered_3d(color_np, alpha_np, covered, uncovered_uv)
+        _dump_stage('1_fill_uncovered')
+        # snapshot the projected colour BEFORE the dark-rescue, so the seam's hair
+        # texels can be kept at their real projected colour (1b/1c would repaint the
+        # darker hair with skin).
+        _pre_rescue = color_np.copy() if seam_hair_mask is not None else None
+        fu.fill_dark_rescue(color_np, alpha_np, uv_mask_np_bool,
+                            p1b_dark_thresh, p1b_sat_thresh,
+                            p1b_bright_fraction, p1b_bright_thresh,
+                            p1b_relative_mode, debug_color)
+        _dump_stage('2_dark_rescue')
+        fu.correct_color_consistency(color_np, uv_mask_np_bool,
+                                     skip=False,
+                                     p1c_k=p1c_k, p1c_iterations=p1c_iterations,
+                                     p1c_frac=p1c_frac, p1c_diff=p1c_diff,
+                                     p1b_relative_mode=p1b_relative_mode)
+        _dump_stage('3_color_consistency')
+        # FOUNDATION + ENFORCE version A as a HARD boundary: BLONDE up to the line,
+        # SKIN after it.  The projection strips the blonde (only ~144 of 2.8M hair
+        # texels survived as blonde), so filling FROM blonde can't work -- instead we
+        # RECOLOUR the whole hair region to blonde: keep each texel's brightness (so
+        # shading/shape is preserved) but set the hue to the blonde tone.  Then cut any
+        # hair colour that sits PAST the line.
+        if False:  # DISABLED: hair colour now comes from the per-face FBX Hair material, not this texture recolour
+            color_np[seam_hair_mask] = _pre_rescue[seam_hair_mask]
+            alpha_np[seam_hair_mask] = 255
+            from scipy.spatial import cKDTree as _CKDe
+            _hair = seam_hair_mask & uv_mask_np_bool
+            BLONDE = (np.array(hair_base_color, dtype=np.float32)
+                      if 'hair_base_color' in dir() and hair_base_color is not None
+                      else np.array([228.0, 198.0, 120.0], dtype=np.float32))   # natural blonde (tunable)
+            if int(_hair.sum()) > 0:
+                _Rf = color_np[:, :, 0].astype(np.float32)
+                _Gf = color_np[:, :, 1].astype(np.float32)
+                _Bf = color_np[:, :, 2].astype(np.float32)
+                # SOLID uniform blonde: center on the MEAN hair brightness and clamp
+                # tightly, so the mangled projection brightness can't blotch it into
+                # streaks.  Reads as one blonde mane with only a whisper of form.
+                _lum = (0.299 * _Rf + 0.587 * _Gf + 0.114 * _Bf)[_hair]
+                _mean = max(float(_lum.mean()), 1.0)
+                _scale = np.clip(_lum / _mean, 0.90, 1.10)[:, None]
+                color_np[_hair] = np.clip(BLONDE[None, :] * _scale, 0, 255).astype(np.uint8)
+                alpha_np[_hair] = 255
+            # HARD CUT after the line: any hair-coloured texel OUTSIDE the region -> skin
+            _Gc = color_np[:, :, 1].astype(np.float32); _Bc = color_np[:, :, 2].astype(np.float32)
+            _ishaircol = (_Bc < 0.85 * _Gc) & (_Gc > 50.0)
+            _bleed = (~seam_hair_mask) & _ishaircol & uv_mask_np_bool
+            _skin_out = (~seam_hair_mask) & (~_ishaircol) & uv_mask_np_bool
+            if int(_bleed.sum()) and int(_skin_out.sum()):
+                _sy, _sx = np.where(_skin_out)
+                if len(_sy) > 800000:
+                    _sub = np.random.default_rng(0).choice(len(_sy), 800000, replace=False)
+                    _sy, _sx = _sy[_sub], _sx[_sub]
+                _tr = _CKDe(tex_pos_np[_sy, _sx].astype(np.float32))
+                _qy, _qx = np.where(_bleed)
+                _, _jj = _tr.query(tex_pos_np[_qy, _qx].astype(np.float32), k=1, workers=-1)
+                color_np[_qy, _qx] = color_np[_sy[_jj], _sx[_jj]]
+            print(f"[SeamHair-recolour] blonde up to line: {int(_hair.sum()):,} texels  "
+                  f"tone={BLONDE.astype(int).tolist()}  cut after line: {int(_bleed.sum()):,}")
+            # DIAG: trace the CROWN (paint height Y>0.40) and ARMS (|X|>0.20) texels
+            _cy = uv_mask_np_bool & (tex_pos_np[:, :, 1] > 0.40)
+            _ar = uv_mask_np_bool & (np.abs(tex_pos_np[:, :, 0]) > 0.20)
+            _Gd = color_np[:, :, 1].astype(np.float32); _Bd = color_np[:, :, 2].astype(np.float32)
+            _isbl = (_Bd < 0.85 * _Gd) & (_Gd > 50.0)
+            print(f"[DIAG-crown] uv_texels={int(_cy.sum()):,}  flagged_hair={int((_cy & seam_hair_mask).sum()):,}  blonde_now={int((_cy & _isbl).sum()):,}")
+            print(f"[DIAG-arms ] uv_texels={int(_ar.sum()):,}  flagged_hair={int((_ar & seam_hair_mask).sum()):,}  blonde_now={int((_ar & _isbl).sum()):,}")
+
+    if not _skip_projection:
+        # Close black cracks at UV-island seam rings (short-range, island-local;
+        # NOT the cross-body 3-D fill). Runs before seam_bleed so the outside pad
+        # then bleeds the already-closed edge colour.
+        fu.fill_interior_seams(color_np, alpha_np)
+    fu.seam_bleed(color_np, alpha_np)
+    fu.colour_correct(color_np, uv_mask_np_bool, saturation_boost, brightness_correction)
+    _dump_stage('4_final')
+
+    # =========================================================================
+    # FLAT SKIN BASE COLOUR — overrides every UV pixel with a solid colour so
+    # the projected skin texture is hidden.  hair_debug_color is applied on top
+    # afterwards, so yellow hair is still visible over the flat skin.
+    # =========================================================================
+    if skin_base_color is not None and not _skip_projection:
+        _skin_arr = np.array(skin_base_color, dtype=np.uint8)
+        color_np[uv_mask_np_bool] = _skin_arr
+        alpha_np[uv_mask_np_bool] = 255
+        print(f"[SkinBase] {int(uv_mask_np_bool.sum()):,} UV px → flat skin {skin_base_color}")
+
+    # =========================================================================
+    # HAIR DEBUG FILL — paint detected hair pixels with a solid debug colour.
+    # Enabled when hair_debug_color is not None (e.g. (255, 255, 255) = white).
+    # Runs a silent HairDetectionUtils pass to build the 3D-based hair mask, then
+    # overrides those texels in color_np.  Alpha is forced to 255 for coverage.
+    # =========================================================================
+    if hair_debug_color is not None and not _skip_projection:
+        if seam_hair_mask is not None:
+            # seam drives the hair mask -> skip the slow old detector + fixture save
+            _hair_mask = seam_hair_mask
+            print(f"[HairDebug] using SEAM hair mask ({int(_hair_mask.sum()):,} px) — old detector + fixture skipped")
         else:
-            filtered_internal_holes = internal_hole_mask
+            from .hair_detection_utils_v2 import HairDetectionUtils
+            print("[HairDebug] Computing hair mask for debug fill...")
+            _hdu_fill = HairDetectionUtils(
+                texture_size   = texture_size,
+                uv_mask        = uv_mask_np_bool,
+                tex_pos_np     = tex_pos_np,
+                tex_normals_np = tex_normals.cpu().numpy(),
+                neck_y_min     = neck_y_min,
+                neck_y_max     = neck_y_max,
+                cyan_y_margin  = cyan_y_margin,
+                cyan_z_frac    = cyan_z_frac,
+                trimesh        = mesh,             # per-face ear detection (uses rasterized mesh's UVs)
+                _norm_verts    = out_verts.detach().cpu().numpy(),
+                _norm_faces    = out_faces.detach().cpu().numpy(),
+                _norm_uvs      = out_uvs.detach().cpu().numpy(),
+            )
+            # Capture fixture so the old mask can be tuned offline without a re-run.
+            import os as _os_hd
+            _fx_hd = _os_hd.path.join(_os_hd.path.dirname(__file__), 'hair_detection_fixture.npz')
+            np.savez_compressed(
+                _fx_hd,
+                tex_pos      = tex_pos_np,
+                tex_normals  = tex_normals.cpu().numpy(),
+                uv_mask      = uv_mask_np_bool,
+                texture_size = np.array([texture_size]),
+                norm_verts   = out_verts.detach().cpu().numpy(),
+                norm_faces   = out_faces.detach().cpu().numpy(),
+                norm_uvs     = out_uvs.detach().cpu().numpy(),
+            )
+            print(f"[Fixture] Saved (hair_debug path) → {_fx_hd}")
+            _hair_mask = _hdu_fill.get_hair_mask()
+        _n_hair    = int(_hair_mask.sum())
+        # KAN-8: save the CLEAN projected base (skin + real hair colour, BEFORE the
+        # debug-yellow is painted) so mask changes can be previewed OFFLINE with no
+        # pipeline run — the removed-hair texels still hold their real skin colour.
+        try:
+            from PIL import Image as _PBImg
+            _PBImg.fromarray(color_np).save(
+                _os_hd.path.join(_os_hd.path.dirname(__file__), '_proj_base.png'))
+            print("[HairDebug] saved clean projected base → _proj_base.png")
+        except Exception as _be:
+            print(f"[HairDebug] base save failed: {_be}")
+        print(f"[HairDebug] {_n_hair:,} hair px → painting {hair_debug_color}")
+        color_np[_hair_mask] = np.array(hair_debug_color, dtype=np.uint8)
+        alpha_np[_hair_mask] = 255
 
-        # 2. UV SEAM PADDING: A small band of pixels just outside the UV islands
-        # We dilate the UV mask by a few pixels to create a "bleed" area
-        pad_radius = 5  # You can increase this if the black lines persist at long distances
-        kernel = np.ones((3, 3), np.uint8)
-        dilated_uv = cv2.dilate(uv_mask_np, kernel, iterations=pad_radius)
-        
-        # The padding mask is the dilated area MINUS the original UV area
-        seam_padding_mask = cv2.bitwise_and(dilated_uv, cv2.bitwise_not(uv_mask_np))
+        # ── EAR + NECK OVERRIDE (OLD detector path only) ──────────────────────
+        # The seam already excludes the ear/neck from hair, so this redundant
+        # override is skipped when the seam drives the mask (and _hdu_fill isn't
+        # built then -- skipping it avoids the UnboundLocalError too).
+        if seam_hair_mask is None:
+            _skin_color = (np.array(skin_base_color, dtype=np.uint8)
+                           if skin_base_color is not None
+                           else np.array((210, 180, 155), dtype=np.uint8))
+            _ear_uv = _hdu_fill.get_ear_uv_mask()
+            if _ear_uv is not None and _ear_uv.any():
+                _n_ear = int(_ear_uv.sum())
+                color_np[_ear_uv] = _skin_color
+                alpha_np[_ear_uv] = 255
+                print(f"[HairDebug] EAR OVERRIDE: {_n_ear:,} px → skin {tuple(_skin_color.tolist())}")
+            _neck_uv = _hdu_fill.get_neck_uv_mask()
+            if _neck_uv is not None and _neck_uv.any():
+                _n_neck = int(_neck_uv.sum())
+                color_np[_neck_uv] = _skin_color
+                alpha_np[_neck_uv] = 255
+                print(f"[HairDebug] NECK OVERRIDE: {_n_neck:,} px → skin {tuple(_skin_color.tolist())}")
 
-        # 3. COMBINE AND INPAINT
-        # We want to inpaint both the internal dots and the external seams simultaneously
-        final_inpaint_mask = cv2.bitwise_or(filtered_internal_holes, seam_padding_mask)
+        # Re-bleed seams AFTER hair/ear/neck paint.  The earlier seam_bleed
+        # (before hair paint) padded the inter-island gutters with the old
+        # SKIN colour, so the hair's back-center UV seam sampled skin → visible
+        # white band.  Re-running now re-pads each gutter with its island's
+        # CURRENT colour (yellow on the hair side) → the seam band disappears.
+        fu.seam_bleed(color_np, alpha_np)
 
-        n_holes = int(filtered_internal_holes.sum())
-        n_pad   = int(seam_padding_mask.sum())
-        print(f"  Inpainting {n_holes} internal texels and {n_pad} seam padding texels...")
+    # In debug_regions mode override color/alpha with geometry-only values now
+    # that all fill passes have been (mostly) skipped.
+    if _skip_projection:
+        tex_pos_np  = tex_pos.cpu().numpy()
+        alpha_np    = uv_hit_mask.cpu().numpy().astype(np.uint8) * 255
+        color_np    = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
+        print("[MultiView] debug_regions: geometry-only mode active — projection skipped")
 
-        if (n_holes + n_pad) > 0:
-            for c in range(3):
-                color_np[..., c] = cv2.inpaint(color_np[..., c], final_inpaint_mask, 3, cv2.INPAINT_NS)
-            alpha_np = cv2.inpaint(alpha_np, final_inpaint_mask, 3, cv2.INPAINT_NS)      
+    # =========================================================================
+    # DEBUG – Paint UV texture with region colours based on 3-D world position.
+    # Replaces the real texture so you can visually verify region boundaries
+    # before committing to per-region colour correction.
+    #
+    # Coordinate system (after normalization, norm_size=1.15):
+    #   +Y = up    (full character: ~-0.575 to +0.575)
+    #   +Z = front (toward viewer at azimuth 0)
+    #   +X = character's LEFT (from viewer's perspective)
+    # =========================================================================
+    if debug_regions:
+        from .hair_detection_utils_v2 import HairDetectionUtils
+        print("[DebugRegions] Running HairDetectionUtils...")
+
+        # ── KAN-8 island-separation A/B metric (prints, no files) ─────────────
+        # Quantifies whether ear surface got its own UV island for the current
+        # `mesh_cluster_threshold_cone_half_angle_rad`.  Watch head_x_max climb
+        # and frac|X|>0.10 go 0→>0 as the cone angle is lowered.
+        try:
+            from .uv_island_diag import analyse_arrays
+            analyse_arrays(tex_pos_np, uv_mask_np_bool, texture_size,
+                           label=f"cone={mesh_cluster_threshold_cone_half_angle_rad}deg "
+                                 f"cyl={use_cylindrical_uv}")
+        except Exception as _e:
+            print(f"[uv_island_diag] skipped: {_e}")
+
+        # ── One-time fixture save for offline unit testing ────────────────────
+        import os as _os
+        _fixture_path = _os.path.join(_os.path.dirname(__file__),
+                                      'hair_detection_fixture.npz')
+        if True:  # KAN-8: ALWAYS refresh so the offline fixture matches the latest run
+            import numpy as _np_fix
+            _np_fix.savez_compressed(
+                _fixture_path,
+                tex_pos      = tex_pos_np,
+                tex_normals  = tex_normals.cpu().numpy(),
+                uv_mask      = uv_mask_np_bool,
+                texture_size = _np_fix.array([texture_size]),
+                # Per-face data — lets offline tools reproduce the ear subtraction
+                # (which needs normalized verts/faces/uvs), so ear-boundary tuning
+                # can be verified without a full pipeline run.
+                norm_verts   = out_verts.detach().cpu().numpy(),
+                norm_faces   = out_faces.detach().cpu().numpy(),
+                norm_uvs     = out_uvs.detach().cpu().numpy(),
+            )
+            print(f"[Fixture] Saved → {_fixture_path}")
+        # ─────────────────────────────────────────────────────────────────────
+
+        hdu = HairDetectionUtils(
+            texture_size   = texture_size,
+            uv_mask        = uv_mask_np_bool,
+            tex_pos_np     = tex_pos_np,
+            tex_normals_np = tex_normals.cpu().numpy(),
+            neck_y_min     = neck_y_min,
+            neck_y_max     = neck_y_max,
+            cyan_y_margin  = cyan_y_margin,
+            cyan_z_frac    = cyan_z_frac,
+            trimesh        = mesh,             # per-face ear detection (uses rasterized mesh's UVs)
+            _norm_verts    = out_verts.detach().cpu().numpy(),
+            _norm_faces    = out_faces.detach().cpu().numpy(),
+            _norm_uvs      = out_uvs.detach().cpu().numpy(),
+        )
+        color_np = hdu.run(color_np)
+
+        # ── Optional flat skin base colour in debug_regions mode ─────────────
+        # Paint UV pixels that the detection left black (background) so the
+        # atlas isn't a pure black backdrop.  Detection overlay colours stay.
+        if skin_base_color is not None:
+            _skin_arr      = np.array(skin_base_color, dtype=np.uint8)
+            _unpainted_sk  = np.all(color_np == 0, axis=2) & uv_mask_np_bool
+            color_np[_unpainted_sk] = _skin_arr
+            print(f"[SkinBase] {int(_unpainted_sk.sum()):,} unpainted UV px → flat skin {skin_base_color}")
+
+        # ── Optional hair-fill overlay on top of the debug canvas ────────────
+        # When hair_debug is also enabled, paint detected hair pixels with the
+        # debug colour, but ONLY on pixels the detection left black (unpainted).
+        # This shows the hair fill region while keeping cyan/yellow/green/magenta
+        # borders visible on top.
+        if hair_debug_color is not None:
+            print("[HairDebug] Computing hair mask for debug overlay...")
+            _hair_mask = seam_hair_mask if seam_hair_mask is not None else hdu.get_hair_mask()
+            _unpainted = np.all(color_np == 0, axis=2) & uv_mask_np_bool
+            _fill_here = _hair_mask & _unpainted
+            color_np[_fill_here] = np.array(hair_debug_color, dtype=np.uint8)
+            print(f"[HairDebug] {int(_hair_mask.sum()):,} hair px → "
+                  f"{int(_fill_here.sum()):,} filled on unpainted px")
+
+        alpha_np = uv_hit_mask.cpu().numpy().astype(np.uint8) * 255
+        print("[DebugRegions] Done — HairDetectionUtils completed.")
+
 
     # =========================================================================
     # STEP 5 – Build output textures and trimesh
@@ -548,7 +1369,10 @@ def texture_mesh_with_multiview(
             
     if metallicRoughnessTexture is None or not use_metallic:
         mr_np = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
-        mr_np[..., 1] = 230
+        # GLTF: G = roughness, B = metallic.
+        # Skin roughness ~0.55 gives natural specularity; 0.9 was too matte/washed.
+        mr_np[..., 1] = int(0.55 * 255)   # roughness 0.55
+        mr_np[..., 2] = 0                  # metallic  0.0
         metallicRoughnessTexture = Image.fromarray(mr_np)
 
     material = trimesh.visual.material.PBRMaterial(
@@ -556,7 +1380,7 @@ def texture_mesh_with_multiview(
         baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
         metallicRoughnessTexture=metallicRoughnessTexture,
         metallicFactor=0.0,
-        roughnessFactor=0.9,
+        roughnessFactor=1.0,   # let texture drive roughness directly
         alphaMode='OPAQUE',
         doubleSided=True,
     )
@@ -573,4 +1397,341 @@ def texture_mesh_with_multiview(
         visual=trimesh.visual.TextureVisuals(uv=uvs_np, material=material),
     )
 
-    return textured_mesh, baseColorTexture, metallicRoughnessTexture
+    return textured_mesh, baseColorTexture, metallicRoughnessTexture, normalMapTexture
+
+
+# ---------------------------------------------------------------------------
+# Alignment preview
+# ---------------------------------------------------------------------------
+
+def render_alignment_preview(
+    mesh: trimesh.Trimesh,
+    image,                          # PIL Image (any mode)
+    azimuth:        float = 0.0,
+    elevation:      float = 0.0,
+    ortho_scale:    float = 1.15,
+    norm_size:      float = 1.15,
+    u_pixel_offset: float = 0.0,
+    v_pixel_offset: float = 0.0,
+    overlay_color:  tuple = (0, 230, 180),   # cyan-green outline
+    overlay_alpha:  float = 0.30,
+) -> Image.Image:
+    """
+    Render the mesh silhouette overlaid on a source image using the exact same
+    auto-alignment math as texture_mesh_with_multiview.  Fast — no texture work.
+    Use to tune u/v pixel offsets before running the full projection.
+    """
+    # ── 1. Normalise mesh (identical two-pass to projection) ─────────────────
+    verts = torch.from_numpy(mesh.vertices).float().cuda()
+    faces = torch.from_numpy(mesh.faces).int().cuda()
+    verts = _normalize_verts(verts, norm_size)
+
+    # ── 2. Camera vectors ────────────────────────────────────────────────────
+    look, right, up = get_camera_vectors(azimuth, elevation, device='cuda')
+
+    s = max(float(ortho_scale), 1e-6)
+
+    # ── 3. Per-vertex clip-space coords (same formula as build_ortho_clip_verts) ──
+    u_clip_v = (verts * right).sum(-1) / (s / 2.0)   # (N,)
+    v_clip_v = (verts * up).sum(-1)    / (s / 2.0)   # (N,)
+
+    # ── 4. Mesh bounds in clip space → alignment params ──────────────────────
+    mesh_u_min = u_clip_v.min().item()
+    mesh_u_max = u_clip_v.max().item()
+    mesh_v_min = v_clip_v.min().item()
+    mesh_v_max = v_clip_v.max().item()
+    mesh_cx    = (mesh_u_min + mesh_u_max) / 2.0
+    mesh_cy    = (mesh_v_min + mesh_v_max) / 2.0
+    mesh_v_span = max(mesh_v_max - mesh_v_min, 1e-6)
+
+    # ── 5. Foreground detection in source image (same as projection code) ─────
+    img_rgba  = np.array(image.convert('RGBA'))
+    img_h, img_w = img_rgba.shape[:2]
+
+    if img_rgba[:, :, 3].min() < 255:
+        fg_mask = img_rgba[:, :, 3] > 127
+    else:
+        bg_color   = img_rgba[0, 0, :3]
+        color_diff = np.abs(img_rgba[:, :, :3].astype(int) - bg_color.astype(int)).sum(axis=-1)
+        fg_mask    = color_diff > 10
+
+    coords = np.argwhere(fg_mask)
+    if len(coords) > 0:
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+        img_char_h  = float(y_max - y_min + 1)
+        img_char_cx = float(coords[:, 1].mean())
+        img_char_cy = float(y_min + y_max) / 2.0   # bbox midpoint — consistent with projection code
+    else:
+        img_char_h  = float(img_h)
+        img_char_cx = float(img_w) * 0.5
+        img_char_cy = float(img_h) * 0.5
+
+    pix_per_clip = img_char_h / mesh_v_span
+
+    print(f"[AlignPreview] az={azimuth:.0f} el={elevation:.0f}  "
+          f"char_cx={img_char_cx:.1f} char_h={img_char_h:.0f}  "
+          f"pix/clip={pix_per_clip:.1f}  "
+          f"u_off={u_pixel_offset:.1f} v_off={v_pixel_offset:.1f}")
+
+    # ── 6. Build image-space NDC clip verts and rasterise at image resolution ─
+    # The projection maps clip → image as:
+    #   x_pix = img_char_cx + (u_clip - mesh_cx) * pix_per_clip + u_pixel_offset
+    #   y_pix = img_char_cy - (v_clip - mesh_cy) * pix_per_clip + v_pixel_offset
+    # Invert to NDC (GL convention: y=-1 bottom, y=+1 top):
+    #   x_ndc = (x_pix + 0.5) / img_w * 2 - 1
+    #   y_ndc = -((y_pix + 0.5) / img_h * 2 - 1)
+
+    x_pix = img_char_cx + (u_clip_v - mesh_cx) * pix_per_clip + u_pixel_offset
+    y_pix = img_char_cy - (v_clip_v - mesh_cy) * pix_per_clip + v_pixel_offset
+
+    x_ndc = (x_pix + 0.5) / img_w * 2.0 - 1.0
+    y_ndc = -(((y_pix + 0.5) / img_h) * 2.0 - 1.0)
+
+    # Depth (same remapping as build_ortho_clip_verts)
+    d     = -(verts * look).sum(-1)
+    d_min = d.min()
+    d_span = (d.max() - d_min).clamp(min=1e-6)
+    z_ndc = 1.0 - 2.0 * (d - d_min) / d_span
+
+    aligned_clip = torch.stack(
+        [x_ndc, y_ndc, z_ndc, torch.ones_like(x_ndc)], dim=-1
+    ).unsqueeze(0)
+
+    ctx  = dr.RasterizeCudaContext()
+    rast, _ = dr.rasterize(ctx, aligned_clip, faces.int(), resolution=[img_h, img_w])
+    hit_mask = (rast[0, :, :, 3] > 0).cpu().numpy()   # (img_h, img_w), y=0 at bottom
+
+    # nvdiffrast y=0 is bottom; image y=0 is top → flip
+    hit_mask = hit_mask[::-1].copy()
+
+    # ── 7. Draw overlay on source image ──────────────────────────────────────
+    img_rgb = np.array(image.convert('RGB')).astype(np.float32)
+    oc = np.array(overlay_color, dtype=np.float32)
+
+    # Semi-transparent fill inside the mesh silhouette
+    img_rgb[hit_mask] = img_rgb[hit_mask] * (1.0 - overlay_alpha) + oc * overlay_alpha
+
+    # Solid 2-px outline at the silhouette boundary
+    hit_u8   = hit_mask.astype(np.uint8)
+    kernel   = np.ones((3, 3), np.uint8)
+    outline  = cv2.dilate(hit_u8, kernel, iterations=2).astype(bool) & ~hit_mask.astype(bool)
+    img_rgb[outline] = oc
+
+    return Image.fromarray(img_rgb.clip(0, 255).astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Standalone view renderer
+# ---------------------------------------------------------------------------
+
+def render_mesh_from_view(
+    mesh: trimesh.Trimesh,
+    azimuth: float,
+    elevation: float,
+    ortho_scale: float = 1.15,
+    norm_size: float   = 1.15,
+    render_size: int   = 1024,
+) -> Image.Image:
+    """
+    Render the existing mesh base-colour texture from a given camera angle.
+
+    Uses identical vertex normalisation and orthographic camera maths as
+    texture_mesh_with_multiview, so the framing is pixel-perfect consistent
+    with the projection stage.
+
+    Returns a PIL RGB image (white background on non-mesh pixels) that can be
+    fed directly as top_image / front_image etc. to the texturing node.
+
+    Raises ValueError if the mesh has no UV or no base-colour texture.
+    """
+    # ── 1. Extract mesh data ─────────────────────────────────────────────────
+    vis = getattr(mesh, 'visual', None)
+    if not (vis is not None and hasattr(vis, 'uv') and vis.uv is not None):
+        raise ValueError("render_mesh_from_view: mesh has no UV coordinates")
+
+    verts = torch.from_numpy(mesh.vertices).float().cuda()
+    faces = torch.from_numpy(mesh.faces).int().cuda()
+    uvs   = torch.from_numpy(vis.uv).float().cuda()          # GL convention: V=0 bottom
+
+    # ── 2. Normalise (two-pass, identical to texture_mesh_with_multiview) ────
+    verts = _normalize_verts(verts, norm_size)
+
+    # ── 3. Load existing base-colour texture ─────────────────────────────────
+    tex_pil = None
+    try:
+        tex_pil = mesh.visual.material.baseColorTexture
+    except AttributeError:
+        pass
+    if tex_pil is None:
+        raise ValueError("render_mesh_from_view: mesh has no baseColorTexture")
+
+    # Flip V so grid_sample convention matches: after flip, UV v=0 → image row 0.
+    tex_np = np.array(tex_pil.convert('RGB')).astype(np.float32) / 255.0
+    tex_np = np.flip(tex_np, axis=0).copy()
+    tex_t  = torch.from_numpy(tex_np).cuda().permute(2, 0, 1).unsqueeze(0).contiguous()  # (1,3,H,W)
+
+    # ── 4. Camera + rasterize ────────────────────────────────────────────────
+    ctx      = dr.RasterizeCudaContext()
+    look, right, up = get_camera_vectors(azimuth, elevation)
+    cam_clip = build_ortho_clip_verts(verts, right, up, look, ortho_scale)
+
+    rast, _  = dr.rasterize(ctx, cam_clip, faces.int(), resolution=[render_size, render_size])
+    hit_mask = (rast[0, :, :, 3] > 0).cpu().numpy()          # bool (H, W) in raster space
+
+    # ── 5. Interpolate UV at each camera pixel ───────────────────────────────
+    uv_at_pix = dr.interpolate(uvs.unsqueeze(0), rast, faces.int())[0][0]  # (H, W, 2)
+
+    # Map GL UV [0,1] → grid_sample [-1,1].  No extra V-flip here because
+    # the texture image was already flipped in step 3.
+    u_g  = uv_at_pix[:, :, 0] * 2.0 - 1.0
+    v_g  = uv_at_pix[:, :, 1] * 2.0 - 1.0
+    grid = torch.stack([u_g, v_g], dim=-1).unsqueeze(0)       # (1, H, W, 2)
+
+    sampled = F.grid_sample(tex_t, grid, mode='bilinear',
+                            padding_mode='border', align_corners=False)
+    rendered = sampled[0].permute(1, 2, 0).cpu().numpy()      # (H, W, 3)
+
+    # ── 6. White background + Y-flip (nvdiffrast Y=0 is bottom, PIL Y=0 top) ─
+    rendered[~hit_mask] = 1.0
+    rendered = rendered[::-1].copy()
+
+    print(f"[RenderView] az={azimuth:.0f} el={elevation:.0f}  "
+          f"hit={hit_mask.sum()} / {render_size*render_size} px")
+    return Image.fromarray((rendered * 255).clip(0, 255).astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Fast per-feature alignment preview (KAN-9)
+# ---------------------------------------------------------------------------
+
+def render_face_projection_preview(
+    mesh: trimesh.Trimesh,
+    image,                              # PIL source image (e.g. the front view)
+    azimuth:           float = 0.0,
+    elevation:         float = 0.0,
+    ortho_scale:       float = 1.15,
+    norm_size:         float = 1.15,
+    u_pixel_offset:    float = 0.0,
+    v_pixel_offset:    float = 0.0,
+    blend:             float = 0.0,     # 0 = photo only; >0 fills shaded relief over photo
+    show_mesh_edges:   bool  = True,    # orange  = mesh GEOMETRIC features (nose/eyes/lips)
+    show_source_edges: bool  = True,    # cyan    = PHOTO features
+    mesh_edge_color:   tuple = (255, 140, 0),
+    source_edge_color: tuple = (0, 230, 230),
+) -> Image.Image:
+    """
+    Fast per-feature alignment check for KAN-9 — NO projection bake, NO fill,
+    NO UV.  Runs in well under a second (one rasterise + one normal interpolate).
+
+    The real bake misplaces colour when the mesh point that is geometrically a
+    feature (lip, eye) gets sampled from an image pixel that is NOT that feature.
+    So the thing to compare is the MESH's own features against the PHOTO's
+    features, both placed by the *identical* auto-alignment mapping the texturing
+    node uses (height-bbox scale + foreground centroid).  This renders the mesh
+    with simple front-lit shading so nose / eye-sockets / lips / jaw relief shows,
+    frames it onto the photo with that mapping, and overlays:
+
+      • orange edges = where the MESH's geometric features sit
+      • cyan   edges = where the PHOTO's features sit
+
+    If orange sits on cyan, alignment is correct.  Any orange→cyan offset is the
+    misalignment that will smear colour onto the wrong geometry during the bake —
+    read its direction/size straight off the image, and tune u/v_pixel_offset (or
+    diagnose a scale/proportion mismatch) without a 10-minute pipeline run.
+    """
+    verts = torch.from_numpy(mesh.vertices).float().cuda()
+    faces = torch.from_numpy(mesh.faces).int().cuda()
+    verts = _normalize_verts(verts, norm_size)
+
+    # Vertex normals (trigger trimesh computation if absent)
+    vn = np.asarray(mesh.vertex_normals)
+    if vn is None or len(vn) != len(mesh.vertices):
+        mesh.vertex_normals  # property access forces recompute
+        vn = np.asarray(mesh.vertex_normals)
+    nrm = torch.from_numpy(vn).float().cuda()
+    nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-8)
+
+    look, right, up = get_camera_vectors(azimuth, elevation, device='cuda')
+
+    # Per-vertex clip coords (same formula as build_ortho_clip_verts)
+    s = max(float(ortho_scale), 1e-6)
+    u_clip_v = (verts * right).sum(-1) / (s / 2.0)
+    v_clip_v = (verts * up).sum(-1)    / (s / 2.0)
+
+    mesh_u_min = u_clip_v.min().item(); mesh_u_max = u_clip_v.max().item()
+    mesh_v_min = v_clip_v.min().item(); mesh_v_max = v_clip_v.max().item()
+    mesh_cx     = (mesh_u_min + mesh_u_max) / 2.0
+    mesh_cy     = (mesh_v_min + mesh_v_max) / 2.0
+    mesh_v_span = max(mesh_v_max - mesh_v_min, 1e-6)
+
+    # Source image + foreground bbox (identical to the bake's body-anchored align)
+    img_rgb = np.array(image.convert('RGB')).astype(np.float32) / 255.0
+    img_h, img_w = img_rgb.shape[:2]
+
+    img_rgba = np.array(image.convert('RGBA'))
+    if img_rgba[:, :, 3].min() < 255:
+        fg_mask = img_rgba[:, :, 3] > 127
+    else:
+        bg = img_rgba[0, 0, :3]
+        fg_mask = np.abs(img_rgba[:, :, :3].astype(int) - bg.astype(int)).sum(-1) > 10
+
+    coords = np.argwhere(fg_mask)
+    if len(coords) > 0:
+        y0, _x0 = coords.min(0); y1, _x1 = coords.max(0)
+        img_char_h  = float(y1 - y0 + 1)
+        img_char_cx = float(coords[:, 1].mean())
+        img_char_cy = float(y0 + y1) / 2.0
+    else:
+        img_char_h = float(img_h); img_char_cx = img_w * 0.5; img_char_cy = img_h * 0.5
+
+    pix_per_clip = img_char_h / mesh_v_span
+
+    x_pix = img_char_cx + (u_clip_v - mesh_cx) * pix_per_clip + u_pixel_offset
+    y_pix = img_char_cy - (v_clip_v - mesh_cy) * pix_per_clip + v_pixel_offset
+    x_ndc = (x_pix + 0.5) / img_w * 2.0 - 1.0
+    y_ndc = -(((y_pix + 0.5) / img_h) * 2.0 - 1.0)
+
+    d      = -(verts * look).sum(-1)
+    d_min  = d.min(); d_span = (d.max() - d_min).clamp(min=1e-6)
+    z_ndc  = 1.0 - 2.0 * (d - d_min) / d_span
+
+    clip = torch.stack([x_ndc, y_ndc, z_ndc, torch.ones_like(x_ndc)], dim=-1).unsqueeze(0)
+
+    ctx = dr.RasterizeCudaContext()
+    rast, _ = dr.rasterize(ctx, clip, faces.int(), resolution=[img_h, img_w])
+    hit = rast[0, :, :, 3] > 0
+
+    pix_nrm = dr.interpolate(nrm.unsqueeze(0), rast, faces.int())[0][0]
+    pix_nrm = pix_nrm / (pix_nrm.norm(dim=-1, keepdim=True) + 1e-8)
+    lambert = (pix_nrm * (-look)).sum(-1).clamp(0.0, 1.0)
+    shade   = (0.25 + 0.75 * lambert)            # soft ambient floor
+
+    # nvdiffrast Y=0 is bottom; flip to image (top-down) orientation
+    hit_np   = hit.cpu().numpy()[::-1].copy()
+    shade_np = shade.cpu().numpy()[::-1].copy()
+
+    out = img_rgb.copy()
+    b = float(np.clip(blend, 0.0, 1.0))
+    if b > 0.0:
+        shaded_rgb = np.repeat(shade_np[..., None], 3, axis=2)
+        out[hit_np] = (1.0 - b) * img_rgb[hit_np] + b * shaded_rgb[hit_np]
+    out_u8 = (out * 255).clip(0, 255).astype(np.uint8)
+
+    # Orange = mesh geometric-feature edges (Canny on the shaded relief)
+    if show_mesh_edges:
+        sh_u8 = (shade_np * 255).clip(0, 255).astype(np.uint8)
+        me = cv2.Canny(sh_u8, 40, 110)
+        me = cv2.dilate(me, np.ones((2, 2), np.uint8), 1).astype(bool) & hit_np
+        out_u8[me] = np.array(mesh_edge_color, dtype=np.uint8)
+
+    # Cyan = photo feature edges
+    if show_source_edges:
+        g  = cv2.cvtColor((img_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        se = cv2.Canny(g, 60, 150)
+        se = cv2.dilate(se, np.ones((2, 2), np.uint8), 1).astype(bool) & fg_mask
+        out_u8[se] = np.array(source_edge_color, dtype=np.uint8)
+
+    print(f"[FaceAlignPreview] az={azimuth:.0f} el={elevation:.0f}  "
+          f"hit={int(hit_np.sum())}px  pix/clip={pix_per_clip:.1f}")
+    return Image.fromarray(out_u8)

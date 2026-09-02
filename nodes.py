@@ -527,7 +527,7 @@ class Trellis2MeshWithVoxelGenerator:
         
         images = tensor_batch_to_pil_list(image, max_views=max_views)
         image_in = images[0] if len(images) == 1 else images
-        
+
         sparse_structure_sampler_params = {"steps":sparse_structure_steps}
         shape_slat_sampler_params = {"steps":shape_steps}
         tex_slat_sampler_params = {"steps":texture_steps}
@@ -584,8 +584,8 @@ class Trellis2LoadImageWithTransparency:
 
     CATEGORY = "Trellis2Wrapper"
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", )
-    RETURN_NAMES = ("image", "mask", "image_with_alpha")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("image", "mask", "image_with_alpha", "character_name")
     FUNCTION = "load_image"
     def load_image(self, image):
         image_path = folder_paths.get_annotated_filepath(image)
@@ -637,7 +637,8 @@ class Trellis2LoadImageWithTransparency:
             output_mask = output_masks[0]
             output_image_ori = output_images_ori[0]
 
-        return (output_image, output_mask, output_image_ori)
+        character_name = Path(image_path).stem   # use image_path: `image` got clobbered to a Tensor in the loop above
+        return (output_image, output_mask, output_image_ori, character_name)
 
     @classmethod
     def IS_CHANGED(s, image):
@@ -864,6 +865,11 @@ class Trellis2ExportMesh:
                 "trimesh": ("TRIMESH",),
                 "filename_prefix": ("STRING", {"default": "3D/Trellis2"}),
                 "file_format": (["glb", "obj", "ply", "stl", "3mf", "dae"],),
+            },
+            "optional": {
+                "character_name": ("STRING", {"default": "",
+                                              "tooltip": "When set, saves to output/characters/{character_name}/ "
+                                                         "and ignores filename_prefix. Type the character image name here."}),
             }
         }
 
@@ -873,10 +879,18 @@ class Trellis2ExportMesh:
     CATEGORY = "Trellis2Wrapper"
     OUTPUT_NODE = True
 
-    def process(self, trimesh, filename_prefix, file_format):        
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())                      
+    def process(self, trimesh, filename_prefix, file_format, character_name=""):
+        # If character_name is supplied, override prefix → output/characters/{name}/
+        char = (character_name or "").strip()
+        if char:
+            # Strip any file extension the user may have typed (e.g. "elf.png" → "elf")
+            char = Path(char).stem
+            filename_prefix = f"characters/{char}"
+            print(f"[ExportMesh] character_name={char!r} → saving to characters/{char}/")
+
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())
         output_glb_path = Path(full_output_folder, f'{filename}_{counter:05}_.{file_format}')
-        output_glb_path.parent.mkdir(exist_ok=True)
+        output_glb_path.parent.mkdir(parents=True, exist_ok=True)
 
         if file_format=='obj':
             materialName = f"{filename}_{counter:05}_.mtl"
@@ -886,9 +900,9 @@ class Trellis2ExportMesh:
             trimesh.export(output_glb_path, file_type=file_format, mtl_name=materialName)
         else:
             trimesh.export(output_glb_path, file_type=file_format)
-            
+
         relative_path = Path(subfolder) / f'{filename}_{counter:05}_.{file_format}'
-        
+
         return (str(output_glb_path), str(relative_path), )        
         
 class Trellis2PostProcessMesh:
@@ -1406,7 +1420,7 @@ class Trellis2MeshWithVoxelAdvancedGenerator:
         
         images = tensor_batch_to_pil_list(image, max_views=max_views)
         image_in = images[0] if len(images) == 1 else images
-        
+
         sparse_structure_guidance_interval = [sparse_structure_guidance_interval_start,sparse_structure_guidance_interval_end]
         shape_guidance_interval = [shape_guidance_interval_start,shape_guidance_interval_end]
         texture_guidance_interval = [texture_guidance_interval_start,texture_guidance_interval_end]
@@ -2157,7 +2171,7 @@ class Trellis2Remesh:
             band = remesh_band,
             project_back = remesh_project, # Snaps vertices back to original surface
             verbose = True,
-            remove_inner_faces = remove_inner_faces,
+            # remove_inner_faces not supported in this CuMesh version
             #bvh = bvh,
         )
         
@@ -2486,6 +2500,12 @@ class Trellis2PreProcessImage:
     CATEGORY = "Trellis2Wrapper"
 
     def process(self, image, padding, remove_background, max_size):
+        try:   # save the RAW front photo for the in-bake hairline face mask (== offline; BEFORE bg-removal/preprocess,
+               # so it matches what _gs_facemask was verified against). Read during the SEAM step. Fresh per character.
+            tensor_batch_to_pil_list(image)[0].convert('RGB').save(
+                r'C:\applications\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\ComfyUI\uv_transfer\_front_photo.png')
+        except Exception as _spe:
+            print(f"[hairline] could not save _front_photo.png ({_spe!r})")
         if image.ndim == 3:
             image = tensor2pil(image)
             
@@ -3724,7 +3744,7 @@ class Trellis2MeshWithVoxelCascadeGenerator:
         
         images = tensor_batch_to_pil_list(image, max_views=max_views)
         image_in = images[0] if len(images) == 1 else images
-        
+
         sparse_structure_guidance_interval = [sparse_structure_guidance_interval_start,sparse_structure_guidance_interval_end]
         low_res_shape_guidance_interval = [low_res_shape_guidance_interval_start, low_res_shape_guidance_interval_end]
         high_res_shape_guidance_interval = [high_res_shape_guidance_interval_start, high_res_shape_guidance_interval_end]
@@ -4373,36 +4393,199 @@ class Trellis2MultiViewTexturing:
                 "use_metallic": ("BOOLEAN",{"default":True}),
                 "depth_eps": ("FLOAT",{"default":0.0100,"min":0.0001,"max":1.0000,"step":0.0001}),
                 "mesh_cluster_threshold_cone_half_angle_rad": ("FLOAT",{"default":60,"min":1,"max":179,"step":1}),
+                "u_pixel_offset": ("FLOAT",{"default":0.0,"min":-200.0,"max":200.0,"step":0.5,
+                                             "tooltip":"Shift image sampling right (+) or left (-) in pixels. Use to correct eye/feature horizontal misalignment."}),
+                "v_pixel_offset": ("FLOAT",{"default":0.0,"min":-200.0,"max":200.0,"step":0.5,
+                                             "tooltip":"Shift image sampling down (+) or up (-) in pixels. Use to correct eye/feature vertical misalignment."}),
+                "use_cylindrical_uv": ("BOOLEAN", {"default": True, "tooltip": "Use cylindrical UV (U=azimuth, V=height) instead of xatlas island UV. Eliminates 163k micro-island mosaic artifacts. Seam placed at back of character. Automatically sets projection-only mode."}),
+                "saturation_boost": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 3.0, "step": 0.05,
+                                               "tooltip": "Boost texture saturation after projection (>1 = more vivid). Compensates for SV3D's washed-out lighting. 1.0 = no change."}),
             },
             "optional": {
                 # Standard views
-                "front_image": ("IMAGE",),   # az=0, el=0
-                "back_image": ("IMAGE",),    # az=180, el=0
-                "left_image": ("IMAGE",),    # az=90, el=0
-                "right_image": ("IMAGE",),   # az=270, el=0
-                "top_image": ("IMAGE",),     # az=0, el=90
-                "bottom_image": ("IMAGE",),  # az=0, el=-90
+                "front_image":  ("IMAGE",),   # az=0°
+                "back_image":   ("IMAGE",),   # az≈188.6° for SV3D frame 11
+                "left_image":   ("IMAGE",),   # az≈102.9° for SV3D frame 6
+                "right_image":  ("IMAGE",),   # az≈274.3° for SV3D frame 16
+                "top_image":    ("IMAGE",),   # el=90°
+                "bottom_image": ("IMAGE",),   # el=-90°
                 "front_weight": ("FLOAT",{"default":1.000,"min":0.001,"max":1.000,"step":0.001}),
-                "back_weight": ("FLOAT",{"default":1.000,"min":0.001,"max":1.000,"step":0.001}),
-                "left_weight": ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
+                "back_weight":  ("FLOAT",{"default":1.000,"min":0.001,"max":1.000,"step":0.001}),
+                "left_weight":  ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
                 "right_weight": ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
-                "top_weight": ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
-                "bottom_weight": ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
+                "top_weight":   ("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
+                "bottom_weight":("FLOAT",{"default":0.010,"min":0.001,"max":1.000,"step":0.001}),
                 # Custom views
                 "custom_images": ("IMAGE",),
                 "custom_azimuths": ("STRING", {"default": ""}),
                 "custom_elevations": ("STRING", {"default": ""}),
                 "custom_weights": ("STRING", {"default": ""}),
                 "camera_config": ("HY3DCAMERA",),
+                # Colour correction – appended so old workflow widget_values are unaffected
+                "brightness_correction": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.01,
+                                                    "tooltip": "Multiply texture brightness after projection. 1.0 = no change. < 1 darkens (was hardcoded 0.88 before — that was making the back too dark)."}),
+                # Per-view azimuth overrides – appended AFTER brightness_correction so old widget_values
+                # (which end at brightness_correction) are not displaced.
+                # SV3D generates 21 frames uniformly over 360°: frame_az = frame_i × 360/21 ≈ 17.14°/frame.
+                #
+                # RECOMMENDED setup — weighted-blend two adjacent SV3D frames (length=2 on the frame
+                # extractor) to land on exactly 90°/180°/270°.  SV3D frame spacing = 360/21 ≈ 17.143°.
+                #   Left : frames 5+6  (85.714°/102.857°) → left_blend=0.25  → 75%×fr5 + 25%×fr6 = 90.0° exact
+                #   Back : frames 10+11 (171.429°/188.571°) → back_blend=0.50 → 50/50             = 180.0° exact
+                #   Right: frames 15+16 (257.143°/274.286°) → right_blend=0.75 → 25%×fr15+75%×fr16 = 270.0° exact
+                #
+                # Single-frame equivalents (length=1, blend ignored):
+                #   Left: start=6 → 102.9°   Back: start=11 → 188.6°   Right: start=16 → 274.3°
+                "left_azimuth":  ("FLOAT",{"default": 90.0, "min":0.0,"max":360.0,"step":0.1,
+                                           "tooltip":"Azimuth used for the left view projection. "
+                                                     "Keep at 90.0 when using length=2 + left_blend=0.25."}),
+                "back_azimuth":  ("FLOAT",{"default":180.0, "min":0.0,"max":360.0,"step":0.1,
+                                           "tooltip":"Azimuth used for the back view projection. "
+                                                     "180.0 is exact with length=2 + back_blend=0.50."}),
+                "right_azimuth": ("FLOAT",{"default":270.0, "min":0.0,"max":360.0,"step":0.1,
+                                           "tooltip":"Azimuth used for the right view projection. "
+                                                     "Keep at 270.0 when using length=2 + right_blend=0.75."}),
+                # Weighted frame blend – appended last so old widget_values are unaffected.
+                # Controls how two-frame batches (length=2 from the SV3D frame extractor) are mixed.
+                # blend=0.0 → 100% first frame,  blend=1.0 → 100% second frame.
+                # Defaults give exactly cardinal angles:
+                #   left_blend=0.25  → 75%×frame5(85.7°)  + 25%×frame6(102.9°)  = 90.0°
+                #   back_blend=0.50  → 50%×frame10(171.4°) + 50%×frame11(188.6°) = 180.0°
+                #   right_blend=0.75 → 25%×frame15(257.1°) + 75%×frame16(274.3°) = 270.0°
+                "left_blend":  ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "Weight of the 2nd frame when left_image is a 2-frame batch. 0.25 → exactly 90°."}),
+                "back_blend":  ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "Weight of the 2nd frame when back_image is a 2-frame batch. 0.50 → exactly 180°."}),
+                "right_blend": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "Weight of the 2nd frame when right_image is a 2-frame batch. 0.75 → exactly 270°."}),
+                # Debug: paint rescued dark texels a flat colour instead of filling from neighbours.
+                # Leave empty for normal operation.  Example values: "0,220,0" (green), "255,0,255" (magenta).
+                "debug_color": ("STRING", {"default": "",
+                                           "tooltip": "Optional debug colour for Pass 1b dark-pixel rescue. "
+                                                      "Format: R,G,B  e.g. '0,220,0' for green. "
+                                                      "Leave empty for normal nearest-neighbour fill."}),
+                # Pass 1b thresholds — ORDER MATTERS: positions 3-7 must match saved workflow widget_values.
+                # pos 3: p1b_dark_thresh  (was always here)
+                # pos 4: p1b_bright_thresh (restored to original position 4)
+                # pos 5: p1b_sat_thresh    (restored to original position 5)
+                # pos 6: p1b_relative_mode (BOOL, replaces old p1b_require_brightness BOOL — same type/default=True)
+                # pos 7: p1c_frac          (restored)
+                # pos 8: p1c_diff          (restored)
+                # pos 9: p1b_bright_fraction (NEW — appended at end, no index shift)
+                "p1b_dark_thresh":    ("INT",     {"default": 150, "min": 0,   "max": 255, "step": 5,
+                                                   "tooltip": "Pass 1b: rescue UV texels with mean RGB below this. 150 catches seam shadows + near-black."}),
+                "p1b_bright_thresh":  ("INT",     {"default": 180, "min": 0,   "max": 255, "step": 5,
+                                                   "tooltip": "Pass 1b (absolute mode only): sources must have mean RGB >= this value. "
+                                                              "Ignored when p1b_relative_mode is ON."}),
+                "p1b_sat_thresh":     ("INT",     {"default": 55,  "min": 0,   "max": 255, "step": 5,
+                                                   "tooltip": "Pass 1b: sources must have HSV saturation above this (0-255). Prevents grey pixels being used as fill sources."}),
+                "p1b_relative_mode":  ("BOOLEAN", {"default": True,
+                                                   "tooltip": "Pass 1b source brightness mode.\n"
+                                                              "ON  (relative): floor = median saturated pixel brightness × p1b_bright_fraction — adapts to any skin tone.\n"
+                                                              "OFF (absolute): floor = p1b_bright_thresh — fixed value, same behaviour as before."}),
+                # Pass 1c thresholds
+                "p1c_frac":           ("FLOAT",   {"default": 0.58, "min": 0.0, "max": 1.0, "step": 0.05,
+                                                   "tooltip": "Pass 1c: texel is a grey outlier if its saturation < FRAC × neighbour median saturation. Higher = more aggressive correction."}),
+                "p1c_diff":           ("INT",     {"default": 18,  "min": 0,   "max": 128, "step": 2,
+                                                   "tooltip": "Pass 1c: minimum mean per-channel difference vs neighbourhood median to trigger correction."}),
+                # NEW — appended at end so existing saved workflows keep their values for all widgets above.
+                "p1b_bright_fraction": ("FLOAT",  {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05,
+                                                   "tooltip": "Pass 1b (relative mode): source brightness must be >= this fraction of the character's own median skin brightness.\n"
+                                                              "0.6 = source must be at least 60% as bright as the median saturated pixel. Lower to allow darker sources."}),
+                "debug_regions":       ("BOOLEAN", {"default": False,
+                                                    "tooltip": "Replace output texture with a K-means colour cluster map (flat debug colours).\n"
+                                                               "Use to identify which pixels belong to skin / hair / lips / etc.\n"
+                                                               "Cluster summary printed to log with average RGB per cluster."}),
+                "p1c_k":              ("INT",     {"default": 96, "min": 8, "max": 512, "step": 8,
+                                                   "tooltip": "Pass 1c: number of 3-D nearest neighbours used to compute the local colour median.\n"
+                                                              "Increase when grey patches are large (the neighbourhood must reach correctly-coloured pixels outside the grey zone).\n"
+                                                              "96–128 for arm tops; higher values are slower."}),
+                "p1c_iterations":     ("INT",     {"default": 5, "min": 1, "max": 10, "step": 1,
+                                                   "tooltip": "Pass 1c: number of correction passes.\n"
+                                                              "Each iteration corrects the outer edge of the grey zone; pixels fixed in pass N become valid sources in pass N+1.\n"
+                                                              "3–5 passes flood-fills inward through large grey patches. Stops early if nothing changed."}),
+                # ── Neck-region filter ────────────────────────────────────────
+                # Suppresses hair-edge detections in the neck zone (never hair).
+                # Zone = forward-facing (Z > 0), central, near head-body seam.
+                "neck_y_min":    ("FLOAT", {"default": 0.30, "min": 0.0, "max": 0.55, "step": 0.01,
+                                            "tooltip":
+                                                "Neck filter — absolute world-Y bottom of the neck zone "
+                                                "(character normalised to Y ±0.575; feet at −0.575, top of head at ~+0.525).\n"
+                                                "Any forward-facing (Z > 0) detected edge between neck_y_min and neck_y_max is suppressed — "
+                                                "the neck is never hair.\n"
+                                                "0.30 ≈ top of the shoulders. Raise if stray edges appear below the neck; "
+                                                "lower if the bottom of the neck is incorrectly suppressed."}),
+                "neck_y_max":    ("FLOAT", {"default": 0.42, "min": 0.0, "max": 0.55, "step": 0.01,
+                                            "tooltip":
+                                                "Neck filter — absolute world-Y top of the neck zone.\n"
+                                                "T_seam_floor (head-body boundary) is typically ~0.372; "
+                                                "0.42 extends ~5 cm above it to catch forward-facing strays just inside the head zone.\n"
+                                                "Raise (e.g. 0.46) if the very base of the hairline is mis-detected as neck; "
+                                                "lower toward 0.37 to shrink the suppression zone."}),
+                # ── Cyan hairline edge filter ─────────────────────────────────
+                # Controls which Z-Canny edges survive as the cyan hairline layer.
+                "cyan_y_margin": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.00, "step": 0.05,
+                                            "tooltip":
+                                                "Cyan hairline: Y-band floor for Canny edges. "
+                                                "floor = T_hair − margin × (T_hair − T_seam_floor).\n"
+                                                "Range 0.0 – 1.0. 1.0 = no Y filter (all edges kept). "
+                                                "0.95 = floor just 5 % above the nape — lets temple edges go as low as needed. "
+                                                "Decrease (e.g. 0.70) to trim more of the lower head zone; risks clipping temple hairline. "
+                                                "Increase toward 1.0 if the temple hairline is cut off too early."}),
+                "cyan_z_frac":   ("FLOAT", {"default": 0.72, "min": 0.0, "max": 1.00, "step": 0.05,
+                                            "tooltip":
+                                                "Cyan hairline: Z upper-bound. Keeps only Canny edges where world-Z < Z_max × this fraction. "
+                                                "The real hairline sits near Z = 0; face-interior UV-seam noise sits at high Z (Z_max ≈ 0.07).\n"
+                                                "Range 0.0 – 1.0. 0.42 keeps edges below ~42 % of Z_max (≈ Z < 0.03). "
+                                                "Decrease (e.g. 0.30) to remove more face-cap noise; "
+                                                "increase (e.g. 0.55) if valid temple edges near the face are lost."}),
+                # ── Hair debug fill ───────────────────────────────────────────
+                "hair_debug":    ("BOOLEAN", {"default": False,
+                                              "tooltip": "Paint detected hair pixels yellow on the output texture.\n"
+                                                         "Uses the same 3D-based detection as debug_regions (hair cap + braid) "
+                                                         "but applied to the real projected texture, not a debug canvas.\n"
+                                                         "Enable to verify hair coverage before wiring up actual hair colour."}),
+                # ── Flat skin base colour ─────────────────────────────────────
+                "flat_skin":     ("BOOLEAN", {"default": False,
+                                              "tooltip": "Replace the projected skin texture with a flat neutral skin tone.\n"
+                                                         "Use together with hair_debug to see yellow hair over flat skin "
+                                                         "without the projection artefacts distracting from hair coverage."}),
+                # ── KAN-9 face-front weighting ────────────────────────────────
+                "face_front_only": ("BOOLEAN", {"default": True,
+                                              "tooltip": "KAN-9: in the face region (forward-facing, central, upper head) "
+                                                         "paint from the SINGLE most-frontal view only, suppressing side/SV3D "
+                                                         "views there.\n"
+                                                         "Fixes ghosted / double-exposed eyes, nose and mouth caused by "
+                                                         "multi-view blending of misaligned features.\n"
+                                                         "Note: this stops ghosting; it does not correct a front view that is "
+                                                         "itself misaligned (that's a separate alignment fix)."}),
+                "face_landmark_warp": ("BOOLEAN", {"default": True,
+                                              "tooltip": "KAN-9: per-feature face alignment. Detects 478 MediaPipe FaceLandmarker "
+                                                         "points on a render of the mesh face AND on the front image, then warps "
+                                                         "(thin-plate spline) the front view's sample positions in the face region "
+                                                         "so eyes/nose/mouth land on the mesh's features.\n"
+                                                         "Fixes the asymmetric per-feature misalignment a single global transform "
+                                                         "cannot. Front view only; face region only (soft mask)."}),
+                "dump_stages": ("BOOLEAN", {"default": True,
+                                              "tooltip": "KAN-9 debug: save the UV atlas after each post-projection stage "
+                                                         "(_stage_0_projected .. _stage_4_final) to the uv_transfer folder, so you "
+                                                         "can see exactly which stage alters the face. Diagnostic only."}),
+                "fast_skin_fill": ("BOOLEAN", {"default": True,
+                                              "tooltip": "Front-only CYLINDRICAL fill: keep the projected front, fill uncovered "
+                                                         "back/side texels by interpolating the two still-visible silhouette-edge "
+                                                         "colours around the body per height band — photo-derived, height-varying skin "
+                                                         "(NOT a flat slab). Skips the expensive 3D KD-tree fill + dark-rescue + "
+                                                         "colour-consistency (~2-3 min on a 4k atlas) and the dark-rescue face-flatten. "
+                                                         "Turn off for the old KD-tree multi-view fill."}),
             }
         }
     
-    RETURN_TYPES = ("TRIMESH", "IMAGE", "IMAGE",)
-    RETURN_NAMES = ("trimesh", "base_color", "metallic_roughness",)
+    RETURN_TYPES = ("TRIMESH", "IMAGE", "IMAGE", "IMAGE",)
+    RETURN_NAMES = ("trimesh", "base_color", "metallic_roughness", "normal_map",)
     FUNCTION = "process"
     CATEGORY = "Trellis2Wrapper"
     OUTPUT_NODE = True
-    
+
     def process(
         self,
         trimesh,
@@ -4416,6 +4599,11 @@ class Trellis2MultiViewTexturing:
         use_metallic,
         depth_eps,
         mesh_cluster_threshold_cone_half_angle_rad,
+        u_pixel_offset=0.0,
+        v_pixel_offset=0.0,
+        use_cylindrical_uv=True,
+        saturation_boost=1.0,
+        brightness_correction=1.0,
         baseColorTexture = None,
         front_image=None,
         back_image=None,
@@ -4429,13 +4617,50 @@ class Trellis2MultiViewTexturing:
         right_weight=None,
         top_weight=None,
         bottom_weight=None,
+        left_azimuth=90.0,
+        back_azimuth=180.0,
+        right_azimuth=270.0,
         custom_images=None,
         custom_azimuths="",
         custom_elevations="",
         custom_weights="",
-        camera_config = None
+        camera_config=None,
+        left_blend=0.25,
+        back_blend=0.50,
+        right_blend=0.75,
+        debug_color="",
+        p1b_dark_thresh=150,
+        p1b_bright_thresh=180,
+        p1b_sat_thresh=55,
+        p1b_relative_mode=True,
+        p1c_frac=0.58,
+        p1c_diff=18,
+        p1b_bright_fraction=0.6,
+        p1c_k=96,
+        p1c_iterations=5,
+        debug_regions=False,
+        neck_y_min=0.30,
+        neck_y_max=0.42,
+        cyan_y_margin=0.95,
+        cyan_z_frac=0.72,
+        hair_debug=False,
+        flat_skin=False,
+        face_front_only=True,
+        face_landmark_warp=True,
+        dump_stages=True,
+        fast_skin_fill=True,
     ):
         from .projection.texture_projection_multiview import texture_mesh_with_multiview
+
+        # Parse debug_color string "R,G,B" → tuple, or None for normal operation
+        _debug_color = None
+        if debug_color and debug_color.strip():
+            try:
+                _dc = [int(x.strip()) for x in debug_color.split(",")]
+                if len(_dc) == 3:
+                    _debug_color = tuple(_dc)
+            except Exception:
+                print(f"[MultiView] debug_color parse error: {debug_color!r} — ignoring")
         
         reset_cuda()
         
@@ -4445,24 +4670,28 @@ class Trellis2MultiViewTexturing:
         elevations = []
         weights = []
         
-        # Standard views with their camera angles
+        # Standard views with tunable azimuths for left/back/right.
+        # SV3D frames are at frame_i × 360/21 ≈ 17.14°/frame — NOT at 90/180/270°.
+        # Each tuple: (image, azimuth, elevation, name, weight, blend)
+        # blend = weight of the 2nd frame when the image tensor has batch=2.
+        # Defaults give exactly cardinal angles via weighted blending of adjacent SV3D frames.
         standard_views = [
-            (front_image, 0, 0, "front", front_weight),
-            (back_image, 180, 0, "back", back_weight),
-            (left_image, 90, 0, "left", left_weight),
-            (right_image, 270, 0, "right", right_weight),
-            (top_image, 0, 90, "top", top_weight),
-            (bottom_image, 0, -90, "bottom", bottom_weight),
+            (front_image,  0,             0,   "front",  front_weight, 0.50),
+            (back_image,   back_azimuth,  0,   "back",   back_weight,  back_blend),
+            (left_image,   left_azimuth,  0,   "left",   left_weight,  left_blend),
+            (right_image,  right_azimuth, 0,   "right",  right_weight, right_blend),
+            (top_image,    0,             90,  "top",    top_weight,   0.50),
+            (bottom_image, 0,            -90,  "bottom", bottom_weight, 0.50),
         ]
-        
-        for img, az, el, name, w in standard_views:
+
+        for img, az, el, name, w, blend in standard_views:
             if img is not None:
-                images.append(self._tensor_to_pil(img))
+                images.append(self._tensor_to_pil(img, blend))
                 azimuths.append(az)
                 elevations.append(el)
                 weights.append(w)
                 print(f"[MultiView] Added {name} view (az={az}, el={el}, w={w})")
-        
+
         # Custom views
         if custom_images is not None:
             custom_az_list = self._parse_angles(custom_azimuths)
@@ -4498,7 +4727,7 @@ class Trellis2MultiViewTexturing:
         print(f"[MultiView] Azimuths: {azimuths}")
         print(f"[MultiView] Elevations: {elevations}")
 
-        trimesh_obj, base_color, mr = texture_mesh_with_multiview(
+        trimesh_obj, base_color, mr, normal_map = texture_mesh_with_multiview(
             trimesh,
             images,
             azimuths,
@@ -4513,15 +4742,56 @@ class Trellis2MultiViewTexturing:
             norm_size=norm_size,
             max_hole_size=max_hole_size,
             use_metallic=use_metallic,
-            depth_eps=depth_eps
+            depth_eps=depth_eps,
+            u_pixel_offset=u_pixel_offset,
+            v_pixel_offset=v_pixel_offset,
+            use_cylindrical_uv=use_cylindrical_uv,
+            saturation_boost=saturation_boost,
+            brightness_correction=brightness_correction,
+            debug_color=_debug_color,
+            p1b_dark_thresh=int(p1b_dark_thresh),
+            p1b_sat_thresh=int(p1b_sat_thresh),
+            p1b_bright_fraction=float(p1b_bright_fraction),
+            p1c_k=int(p1c_k),
+            p1c_iterations=int(p1c_iterations),
+            p1b_bright_thresh=int(p1b_bright_thresh),
+            p1b_relative_mode=bool(p1b_relative_mode),
+            p1c_frac=float(p1c_frac),
+            p1c_diff=int(p1c_diff),
+            debug_regions=bool(debug_regions),
+            neck_y_min=float(neck_y_min),
+            neck_y_max=float(neck_y_max),
+            cyan_y_margin=float(cyan_y_margin),
+            cyan_z_frac=float(cyan_z_frac),
+            hair_debug_color=(255, 255, 0) if hair_debug else None,
+            skin_base_color=(210, 180, 155) if flat_skin else None,
+            face_front_only=bool(face_front_only),
+            face_landmark_warp=bool(face_landmark_warp),
+            dump_stages=bool(dump_stages),
+            fast_skin_fill=bool(fast_skin_fill),
         )
-        
-        return (trimesh_obj, pil2tensor(base_color), pil2tensor(mr))
-    
-    def _tensor_to_pil(self, tensor):
-        """Convert ComfyUI IMAGE tensor to PIL."""
+
+        return (trimesh_obj, pil2tensor(base_color), pil2tensor(mr), pil2tensor(normal_map))
+
+    def _tensor_to_pil(self, tensor, blend=0.5):
+        """Convert ComfyUI IMAGE tensor (B,H,W,C) to PIL.
+
+        blend controls how a 2-frame batch is mixed:
+          0.0 = 100% first frame, 1.0 = 100% second frame.
+        This lets you hit exact azimuths — e.g. SV3D frames 5+6 are at
+        85.714° and 102.857°; blend=0.25 gives exactly 90.0°.
+        For batches > 2 frames the equal mean is used (blend is ignored)."""
         if len(tensor.shape) == 4:
-            arr = (tensor[0].cpu().numpy() * 255).astype(np.uint8)
+            if tensor.shape[0] == 2:
+                t = tensor.float().cpu()
+                blended = t[0] * (1.0 - blend) + t[1] * blend
+                arr = (blended.numpy() * 255).clip(0, 255).astype(np.uint8)
+                print(f"[MultiView] _tensor_to_pil: weighted blend of 2 frames (blend={blend:.3f})")
+            elif tensor.shape[0] > 2:
+                arr = (tensor.float().cpu().numpy().mean(axis=0) * 255).clip(0, 255).astype(np.uint8)
+                print(f"[MultiView] _tensor_to_pil: equal-mean of {tensor.shape[0]} frames")
+            else:
+                arr = (tensor[0].cpu().numpy() * 255).astype(np.uint8)
         else:
             arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
         return Image.fromarray(arr)
@@ -4536,6 +4806,56 @@ class Trellis2MultiViewTexturing:
             print(f"[MultiView] Warning: Could not parse angles: {angle_string}")
             return []
             
+class Trellis2RenderViewFromMesh:
+    """
+    Renders the existing base-colour texture of a trimesh from any camera angle
+    using the same orthographic projection as the multi-view texturing stage.
+
+    Use this to generate a top-down (el=90) view from the original Trellis mesh
+    so you can feed it as top_image to Trellis2MultiViewTexturing.  The Trellis
+    mesh has full-coverage texture on every surface including the arm/shoulder
+    tops that SV3D never captures at el=0.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh":    ("TRIMESH",),
+                "azimuth":    ("FLOAT", {"default": 0.0,  "min": -360.0, "max": 360.0, "step": 1.0,
+                                         "tooltip": "Camera azimuth in degrees. 0=front, 90=left, 180=back, 270=right."}),
+                "elevation":  ("FLOAT", {"default": 90.0, "min": -90.0,  "max": 90.0,  "step": 1.0,
+                                         "tooltip": "Camera elevation. 90=top-down, -90=bottom-up, 0=horizontal."}),
+                "ortho_scale":("FLOAT", {"default": 1.15, "min": 0.1,    "max": 5.0,   "step": 0.01,
+                                         "tooltip": "Must match the ortho_scale used in the texturing node."}),
+                "norm_size":  ("FLOAT", {"default": 1.15, "min": 0.1,    "max": 5.0,   "step": 0.01,
+                                         "tooltip": "Must match the norm_size used in the texturing node."}),
+                "render_size":("INT",   {"default": 1024, "min": 256,    "max": 4096,  "step": 64}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("rendered_view",)
+    FUNCTION      = "process"
+    CATEGORY      = "Trellis2Wrapper"
+    OUTPUT_NODE   = False
+
+    def process(self, trimesh, azimuth, elevation, ortho_scale, norm_size, render_size):
+        from .projection.texture_projection_multiview import render_mesh_from_view
+        pil_img = render_mesh_from_view(
+            trimesh,
+            azimuth    = azimuth,
+            elevation  = elevation,
+            ortho_scale= ortho_scale,
+            norm_size  = norm_size,
+            render_size= render_size,
+        )
+        if pil_img is None:
+            raise ValueError("[RenderViewFromMesh] Mesh has no UV/texture — cannot render.")
+        img_np = np.array(pil_img.convert('RGB')).astype(np.float32) / 255.0
+        return (torch.from_numpy(img_np).unsqueeze(0),)   # (1, H, W, 3)
+
+
 class Trellis2ProjectHighPolyToLowPoly:
     """
     Apply texture to mesh by projecting multiple view images.
@@ -4716,9 +5036,15 @@ class Trellis2ProjectHighPolyToLowPoly:
         return (trimesh_obj, pil2tensor(base_color), pil2tensor(mr))
     
     def _tensor_to_pil(self, tensor):
-        """Convert ComfyUI IMAGE tensor to PIL."""
+        """Convert ComfyUI IMAGE tensor (B,H,W,C) to PIL.
+        If batch > 1 (e.g. length=2 from the SV3D frame extractor), average all
+        frames so the resulting image represents the midpoint angle between them."""
         if len(tensor.shape) == 4:
-            arr = (tensor[0].cpu().numpy() * 255).astype(np.uint8)
+            if tensor.shape[0] > 1:
+                arr = (tensor.float().cpu().numpy().mean(axis=0) * 255).clip(0, 255).astype(np.uint8)
+                print(f"[MultiView] _tensor_to_pil: averaged {tensor.shape[0]} frames")
+            else:
+                arr = (tensor[0].cpu().numpy() * 255).astype(np.uint8)
         else:
             arr = (tensor.cpu().numpy() * 255).astype(np.uint8)
         return Image.fromarray(arr)
@@ -6421,6 +6747,129 @@ class Trellis2TexSlatMultiViewGenerator:
             
         return slat        
         
+class Trellis2AlignmentPreview:
+    """
+    Renders the mesh silhouette overlaid on a source image using the exact same
+    auto-alignment math as Trellis2MultiViewTexturing.  Run this first to tune
+    u_pixel_offset / v_pixel_offset without waiting for the full projection.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trimesh":   ("TRIMESH",),
+                "image":     ("IMAGE",),
+            },
+            "optional": {
+                "azimuth":        ("FLOAT",   {"default": 0.0,   "min": -360.0, "max": 360.0, "step": 1.0,
+                                               "tooltip": "Camera azimuth in degrees. 0=front, 90=left, 180=back, 270=right."}),
+                "elevation":      ("FLOAT",   {"default": 0.0,   "min": -90.0,  "max": 90.0,  "step": 1.0,
+                                               "tooltip": "Camera elevation in degrees. 0=horizontal, 90=top-down."}),
+                "ortho_scale":    ("FLOAT",   {"default": 1.15,  "min": 0.1,    "max": 10.0,  "step": 0.05,
+                                               "tooltip": "Must match the ortho_scale in Trellis2MultiViewTexturing."}),
+                "norm_size":      ("FLOAT",   {"default": 1.15,  "min": 0.1,    "max": 10.0,  "step": 0.05,
+                                               "tooltip": "Must match norm_size in Trellis2MultiViewTexturing."}),
+                "x_pixel_offset": ("FLOAT",   {"default": 0.0,   "min": -2048.0,"max": 2048.0,"step": 1.0,
+                                               "tooltip": "Horizontal pixel offset. Positive = mesh shifts RIGHT. Negative = mesh shifts LEFT."}),
+                "y_pixel_offset": ("FLOAT",   {"default": 0.0,   "min": -2048.0,"max": 2048.0,"step": 1.0,
+                                               "tooltip": "Vertical pixel offset. Positive = mesh shifts DOWN. Negative = mesh shifts UP."}),
+                "overlay_alpha":  ("FLOAT",   {"default": 0.30,  "min": 0.0,    "max": 1.0,   "step": 0.05,
+                                               "tooltip": "Opacity of the semi-transparent fill inside the mesh silhouette."}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("preview",)
+    FUNCTION      = "process"
+    CATEGORY      = "Trellis2Wrapper"
+
+    def process(self, trimesh, image,
+                azimuth=0.0, elevation=0.0,
+                ortho_scale=1.15, norm_size=1.15,
+                x_pixel_offset=0.0, y_pixel_offset=0.0,
+                overlay_alpha=0.30):
+        from .projection.texture_projection_multiview import render_alignment_preview
+
+        img_pil = tensor2pil(image)
+
+        result = render_alignment_preview(
+            mesh           = trimesh,
+            image          = img_pil,
+            azimuth        = float(azimuth),
+            elevation      = float(elevation),
+            ortho_scale    = float(ortho_scale),
+            norm_size      = float(norm_size),
+            u_pixel_offset = float(x_pixel_offset),
+            v_pixel_offset = float(y_pixel_offset),
+            overlay_alpha  = float(overlay_alpha),
+        )
+
+        return (pil2tensor(result),)
+
+
+class Trellis2FaceAlignPreview:
+    """
+    KAN-9 fast per-feature alignment check.  Renders the mesh's geometric relief
+    (orange edges = nose/eyes/lips/jaw) onto the source photo using the exact same
+    auto-alignment math as the texturing node, with the photo's own features in
+    cyan.  Orange-on-cyan = aligned; any offset is the misalignment that smears
+    colour during the real bake.  Runs in well under a second — use this instead
+    of the full pipeline to tune u/v offsets or diagnose scale/proportion drift.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trimesh":   ("TRIMESH",),
+                "image":     ("IMAGE",),
+            },
+            "optional": {
+                "azimuth":        ("FLOAT",   {"default": 0.0,   "min": -360.0, "max": 360.0, "step": 1.0,
+                                               "tooltip": "Camera azimuth. 0=front, 90=left, 180=back, 270=right. Use 0 for the front face check."}),
+                "elevation":      ("FLOAT",   {"default": 0.0,   "min": -90.0,  "max": 90.0,  "step": 1.0}),
+                "ortho_scale":    ("FLOAT",   {"default": 1.15,  "min": 0.1,    "max": 10.0,  "step": 0.05,
+                                               "tooltip": "MUST match the ortho_scale used in Trellis2MultiViewTexturing."}),
+                "norm_size":      ("FLOAT",   {"default": 1.15,  "min": 0.1,    "max": 10.0,  "step": 0.05,
+                                               "tooltip": "MUST match norm_size used in Trellis2MultiViewTexturing."}),
+                "blend":          ("FLOAT",   {"default": 0.0,   "min": 0.0,    "max": 1.0,   "step": 0.05,
+                                               "tooltip": "Fill the shaded mesh relief over the photo (0=just edges, 0.5=relief visible). Edges alone are usually clearest."}),
+                "show_mesh_edges":   ("BOOLEAN", {"default": True,
+                                               "tooltip": "Orange = the MESH's geometric feature edges (where the bake will place colour)."}),
+                "show_source_edges": ("BOOLEAN", {"default": True,
+                                               "tooltip": "Cyan = the PHOTO's feature edges (where colour should come from)."}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("preview",)
+    FUNCTION      = "process"
+    CATEGORY      = "Trellis2Wrapper"
+
+    def process(self, trimesh, image,
+                azimuth=0.0, elevation=0.0,
+                ortho_scale=1.15, norm_size=1.15,
+                blend=0.0, show_mesh_edges=True, show_source_edges=True):
+        from .projection.texture_projection_multiview import render_face_projection_preview
+
+        img_pil = tensor2pil(image)
+
+        result = render_face_projection_preview(
+            mesh              = trimesh,
+            image             = img_pil,
+            azimuth           = float(azimuth),
+            elevation         = float(elevation),
+            ortho_scale       = float(ortho_scale),
+            norm_size         = float(norm_size),
+            blend             = float(blend),
+            show_mesh_edges   = bool(show_mesh_edges),
+            show_source_edges = bool(show_source_edges),
+        )
+
+        return (pil2tensor(result),)
+
+
 NODE_CLASS_MAPPINGS = {
     "Trellis2LoadModel": Trellis2LoadModel,
     "Trellis2MeshWithVoxelGenerator": Trellis2MeshWithVoxelGenerator,
@@ -6486,6 +6935,9 @@ NODE_CLASS_MAPPINGS = {
     "Trellis2ShapeMultiViewGenerator": Trellis2ShapeMultiViewGenerator,
     "Trellis2ShapeCascadeMultiViewGenerator": Trellis2ShapeCascadeMultiViewGenerator,
     "Trellis2TexSlatMultiViewGenerator": Trellis2TexSlatMultiViewGenerator,
+    "Trellis2RenderViewFromMesh": Trellis2RenderViewFromMesh,
+    "Trellis2AlignmentPreview": Trellis2AlignmentPreview,
+    "Trellis2FaceAlignPreview": Trellis2FaceAlignPreview,
     }
     
 
@@ -6554,4 +7006,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Trellis2ShapeMultiViewGenerator": "Trellis2 - Shape MultiView Generator",
     "Trellis2ShapeCascadeMultiViewGenerator": "Trellis2 - Shape Cascade MultiView Generator",
     "Trellis2TexSlatMultiViewGenerator": "Trellis2 - Tex Slat MultiView Generator",
+    "Trellis2RenderViewFromMesh": "Trellis2 - Render View From Mesh",
+    "Trellis2AlignmentPreview":  "Trellis2 - Alignment Preview",
+    "Trellis2FaceAlignPreview":  "Trellis2 - Face Align Preview (fast, KAN-9)",
     }

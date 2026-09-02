@@ -207,7 +207,7 @@
       },
       "widgets_values": [
         "microsoft/TRELLIS.2-4B",
-        "flash_attn",
+        "sdpa",
         "cuda",
         true,
         false,

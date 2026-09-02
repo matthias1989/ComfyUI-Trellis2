@@ -10,3 +10,10 @@ o-voxel/*
 nvdiffrast/*
 nvdiffrec/*
 fp8_models/*
+# local pipeline diagnostics (renders / dumps), keep the code
+projection/*.png
+projection/*.npz
+projection/*.npy
+projection/*.txt
+projection/*.bat
+projection/_BACKUP_*/

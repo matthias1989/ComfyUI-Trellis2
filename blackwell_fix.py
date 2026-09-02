@@ -106,11 +106,12 @@ def patch_all(force: bool = False, verbose: bool = True):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # ── 1) Patch torch.cuda.get_device_capability ──
-    _orig_cap = torch.cuda.get_device_capability
-    def _patched_cap(device=None):
-        m, n = _orig_cap(device)
-        return (9, 0) if m >= 10 else (m, n)
-    torch.cuda.get_device_capability = _patched_cap
+    # NOTE: We do NOT globally override get_device_capability because
+    # Triton 3.6.0 supports SM 12.0 natively and patching to (9, 0)
+    # causes it to compile SM 9.0 kernels that cannot run on Blackwell.
+    # The patch is applied only inside cumm/spconv (step 2 below).
+    if verbose:
+        print("[blackwell_fix] Skipping global CC patch — Triton 3.6+ handles SM 12.0 natively")
 
     # ── 2) Patch cumm/spconv compute capability detection ──
     try:
