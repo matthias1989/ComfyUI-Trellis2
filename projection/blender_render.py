@@ -192,14 +192,22 @@ def import_mesh(mesh_path):
     # Return the first imported mesh object
     return bpy.context.view_layer.objects.active
 
-def render_scene(output_path, resolution, rendering):
+def render_scene(output_path, resolution, rendering, engine="CYCLES", samples=512):
     abs_output_path = os.path.abspath(output_path)
     output_dir = os.path.dirname(abs_output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    bpy.context.scene.render.engine = 'CYCLES'
-    configure_gpu(rendering)
+    if engine == "EEVEE":
+        for _e in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
+            try:
+                bpy.context.scene.render.engine = _e; break
+            except TypeError:
+                continue
+    else:
+        bpy.context.scene.render.engine = 'CYCLES'
+        configure_gpu(rendering)
+        bpy.context.scene.cycles.samples = samples
     
     bpy.context.scene.render.resolution_x = resolution
     bpy.context.scene.render.resolution_y = resolution
@@ -233,6 +241,10 @@ def main():
     parser.add_argument('--norm_size', type=float, default=1.15, help="Target size for Max Radius * 2.0")
     parser.add_argument('--resolution', type=int, default=1024)
     parser.add_argument('--rendering', default="GPU")
+    # Fast path for edge/Canny sources: EEVEE at low samples renders a clay view in ~1-2 s
+    # instead of CYCLES 512-sample seconds-to-minutes. Defaults keep the original behaviour.
+    parser.add_argument('--engine', default="CYCLES", choices=["CYCLES", "EEVEE"])
+    parser.add_argument('--samples', type=int, default=512)
     
     args = parser.parse_args(argv)
     
@@ -249,7 +261,7 @@ def main():
     set_camera(args.elev, args.azim, args.distance, args.scale)
     setup_lighting()
     
-    render_scene(args.output, args.resolution, args.rendering)
+    render_scene(args.output, args.resolution, args.rendering, args.engine, args.samples)
 
 if __name__ == "__main__":
     main()

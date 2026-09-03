@@ -3517,6 +3517,46 @@ class Trellis2StringSelector:
         
         return (string,)
 
+def _holefill_report(m, thr):
+    """Print the boundary-loop PERIMETER distribution before filling.
+
+    fill_holes only closes loops with perimeter <= max_hole_perimeter; whatever is left goes to
+    FillHolesNicelyWithMeshlib, which triangulates one hole at a time and is slow. Without knowing
+    the distribution the threshold is guesswork -- this says exactly what each setting would cost.
+    Diagnostic only: never raises.
+    """
+    try:
+        import numpy as _np
+        from scipy.sparse import coo_matrix as _coo
+        from scipy.sparse.csgraph import connected_components as _cc
+        V = m.vertices.detach().cpu().numpy()
+        F = m.faces.detach().cpu().numpy()
+        e = _np.sort(_np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+        uq, cnt = _np.unique(e, axis=0, return_counts=True)
+        b = uq[cnt == 1]
+        if len(b) == 0:
+            print("[HoleFill] no boundary edges (mesh already closed)", flush=True)
+            return
+        n = len(V)
+        g = _coo((_np.ones(len(b)), (b[:, 0], b[:, 1])), shape=(n, n))
+        ncomp, lab = _cc(g, directed=False)
+        seg = _np.linalg.norm(V[b[:, 0]] - V[b[:, 1]], axis=1)
+        per = _np.bincount(lab[b[:, 0]], weights=seg, minlength=ncomp)
+        per = per[per > 0]
+        if not len(per):
+            return
+        q = _np.percentile(per, [50, 75, 90, 95, 99])
+        print(f"[HoleFill] {len(per)} boundary loops | perimeter med {q[0]:.4f} p75 {q[1]:.4f} "
+              f"p90 {q[2]:.4f} p95 {q[3]:.4f} p99 {q[4]:.4f} max {per.max():.4f}", flush=True)
+        print(f"[HoleFill] threshold {thr}: fills {int((per <= thr).sum())}/{len(per)} "
+              f"({100.0 * (per <= thr).mean():.1f}%), leaves {int((per > thr).sum())} for meshlib", flush=True)
+        cover = "  ".join(f"{t:g}->{100.0 * (per <= t).mean():.0f}%" for t in
+                          (0.03, 0.05, 0.1, 0.2, 0.4, 0.8))
+        print(f"[HoleFill] coverage by threshold: {cover}", flush=True)
+    except Exception as _e:
+        print(f"[HoleFill] report skipped ({_e!r})", flush=True)
+
+
 class Trellis2FillHolesWithCuMesh:
     """Fill all holes in a mesh"""
     
@@ -3536,6 +3576,7 @@ class Trellis2FillHolesWithCuMesh:
 
     def process(self, mesh, max_permieters):
         mesh_copy = copy.deepcopy(mesh)
+        _holefill_report(mesh_copy, max_permieters)
         mesh_copy.fill_holes(max_hole_perimeter = max_permieters)
         
         return (mesh_copy,)         
