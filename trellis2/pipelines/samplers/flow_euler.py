@@ -426,9 +426,65 @@ class FlowEulerMultiViewSampler(FlowEulerSampler):
         """
         Compute blending weights for sparse voxels.
         """
+        # Which grid axis is the body's front-back one?  Decide it from the data, not from the
+        # widget.  A standing figure is always thinnest front-to-back, so the axis with the
+        # smallest occupied extent IS depth.
+        #
+        # Measured for this pipeline: the master GLB's accessors give extents 0.877 / 0.999 /
+        # 0.178 and the exporter was verified to apply no transform, so those are mesh space.
+        # nodes.py builds the attribute volume as (vertices - aabb[0]) / voxel_size indexed by
+        # coords[:, 1:] -- a plain affine -- so coords[:, j+1] IS mesh axis j, same order and
+        # sign.  That puts width on coords[:,1] (~27), vertical on coords[:,2] (~31) and depth on
+        # coords[:,3] (~6), and makes +coords[:,3] the front: at head height the +ve extreme is a
+        # 0.018-wide spike (the nose) against a 0.077-wide mass behind (the hair), and the feet
+        # reach +0.080 forward against -0.054 back.
+        #
+        # The widget default 'z' points front/back at coords[:,1] -- the WIDTH axis.  The front
+        # and back images were being blended across the body left-to-right rather than
+        # front-to-back.  It went unnoticed because the raw-coordinate score leaves the weights
+        # nearly uniform (0.248 each), so everything was averaged; it only bites once the weights
+        # are sharpened.
+        #
+        # Both branches below ignore coords[:,2], which is only valid while coords[:,2] is the
+        # vertical axis.  If the thinnest axis turns out to BE coords[:,2] then neither mapping
+        # can work, and that is worth shouting about rather than silently picking one.
+        try:
+            _ext = [int(coords[:, i].max() - coords[:, i].min()) for i in (1, 2, 3)]
+            _thin = min(range(3), key=lambda k: _ext[k])
+            _picked = {0: 'z', 2: 'x'}.get(_thin)
+        except Exception as _ae:
+            _ext, _thin, _picked = None, None, None
+            print(f"[MultiView axes] could not measure ({_ae!r}); keeping front_axis={front_axis!r}")
+
+        _sig = (tuple(_ext) if _ext else None, _picked)
+        if getattr(self, "_axis_sig", None) != _sig:
+            self._axis_sig = _sig
+            if _ext is not None:
+                print(f"[MultiView axes] occupied extents: coords[:,1]={_ext[0]}  "
+                      f"coords[:,2]={_ext[1]}  coords[:,3]={_ext[2]}   widget front_axis={front_axis!r}")
+                if _picked is None:
+                    print("[MultiView axes] the THINNEST axis is coords[:,2], which both mappings "
+                          "ignore -- no correct front_axis exists for this grid. Falling back to "
+                          f"{front_axis!r}; front/back blending is NOT reliable.")
+                else:
+                    print(f"[MultiView axes] depth = coords[:,{_thin + 1}] ({_ext[_thin]} voxels, "
+                          f"thinnest) -> front_axis={_picked!r}"
+                          + ("" if _picked == front_axis
+                             else f"  [OVERRIDING the widget's {front_axis!r}]"))
+        if _picked is not None:
+            front_axis = _picked
+
         # Normalize coords to [-1, 1] range (roughly)
         z = (coords[:, 1].float() / self.resolution) * 2 - 1.0
         x = (coords[:, 3].float() / self.resolution) * 2 - 1.0
+
+        # NOTE 2026-09-11: a direction-cosine sharpen used to sit here.  Removed.  It was
+        # justified by weights measured on 'x' and 'z' -- but the [MultiView axes] check below
+        # shows coords[:,2] is the thin (front-back) axis on this grid and neither branch here
+        # ever reads it, so 'front' vs 'back' was never a front/back distinction at all.
+        # Measured on the reported grid (29 / 5 / 31): front-vs-back separation 0.0000 either
+        # way, while TOP-vs-BOTTOM separation went 0.058 -> 0.151.  All the sharpen did was
+        # make a height-based mislabelling 2.6x more decisive.  Fix the axis, then revisit.
         
         if front_axis == 'z':
             # Front (+Z), Back (-Z), Right (+X), Left (-X)
@@ -478,6 +534,7 @@ class FlowEulerMultiViewSampler(FlowEulerSampler):
         
         # meshgrid 'ij' indexing: (D, H, W) order
         grid_z, grid_y, grid_x = torch.meshgrid(dz, dy, dx, indexing='ij') 
+
         
         # Flatten for vector calc? Or keep structural. Keep structural.
         

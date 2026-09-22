@@ -11,6 +11,54 @@ import meshlib.mrmeshpy as mrmeshpy
 import gc
 
 
+def _repair_hole_centres(old_v, new_v, new_f):
+    """Recompute the vertex CuMesh's fill_holes appends at the centre of every filled loop.
+
+    Measured 2026-09-15 on character_posed_00003_'s cached sculpt: the kernel does not always WRITE
+    those positions. Fresh processes, identical input: faces and every original vertex identical, but
+    the 3,903 appended centres sat at the hole centres in one run and held uninitialised GPU memory
+    (up to 6.9e26) in others. Their fan triangles span the whole volume, the dual-contouring remesh
+    wraps sheets around them (3.48M -> 29M faces) and the bake ends with 36,697 holes. Nothing
+    downstream can see it: the remesh output stays inside its grid, so its coordinate check passes.
+
+    Each appended vertex is the apex of a fan over one loop; set it to the mean of that loop's
+    vertices -- what the kernel produces when it does write them (9e-6 difference on a clean run).
+    """
+    n_old = old_v.shape[0]
+    n_new = new_v.shape[0] - n_old
+    if n_new <= 0:
+        return new_v
+    f = new_f.long()
+    isnew = f >= n_old
+    one = isnew.sum(1) == 1
+    fan = f[one]; m = isnew[one]
+    if fan.shape[0] == 0:
+        return new_v
+    c = fan[m] - n_old                                # the centre each fan triangle belongs to
+    rim = fan[~m].view(-1, 2)                         # its two loop vertices
+    N = n_old + n_new
+    key = torch.unique(torch.cat([c, c]) * N + torch.cat([rim[:, 0], rim[:, 1]]))   # each loop vertex once
+    kc = key // N; kr = key % N
+    acc = torch.zeros((n_new, 3), dtype=new_v.dtype, device=new_v.device)
+    cnt = torch.zeros((n_new,), dtype=new_v.dtype, device=new_v.device)
+    acc.index_add_(0, kc, new_v[kr])
+    cnt.index_add_(0, kc, torch.ones_like(kc, dtype=new_v.dtype))
+    mean = acc / cnt.clamp(min=1)[:, None]
+    # how many the kernel left unwritten: farther from the loop centre than the loop's own farthest vertex
+    reach = torch.zeros((n_new,), dtype=new_v.dtype, device=new_v.device)
+    reach.scatter_reduce_(0, kc, (new_v[kr] - mean[kc]).norm(dim=1), reduce="amax")
+    idx = torch.nonzero(cnt > 0).squeeze(1)
+    old = new_v[idx + n_old]
+    bad = ~torch.isfinite(old).all(1) | ((old - mean[idx]).norm(dim=1) > reach[idx])
+    out = new_v.clone()
+    out[idx + n_old] = mean[idx]
+    nb = int(bad.sum())
+    if nb:
+        print(f"[fill_holes] repaired {nb} of {n_new} hole-centre vertices CuMesh left unwritten "
+              f"(worst |coord| {float(old[bad].abs().max()):.3g})", flush=True)
+    return out
+
+
 class Mesh:
     def __init__(self,
         vertices,
@@ -62,6 +110,7 @@ class Mesh:
             return
         mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
         new_vertices, new_faces = mesh.read()
+        new_vertices = _repair_hole_centres(vertices, new_vertices, new_faces)
         
         del mesh
         gc.collect()         

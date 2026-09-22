@@ -376,13 +376,15 @@ class FillUtils:
     # touch the breast/torso, and stable across per-bake meshes (no colour thresholds).
     # Fixes the browner/darker arm-top by making the whole arm its own reliable front tone.
     # -------------------------------------------------------------------------
-    def wrap_arm_front(self, color_np: np.ndarray, n_bands: int = 120) -> None:
+    def wrap_arm_front(self, color_np: np.ndarray, covered: np.ndarray = None,
+                       n_bands: int = 120) -> None:
         from scipy.ndimage import gaussian_filter1d
         uv = self.uv_mask; tp = self.tex_pos_np
         px, py, pz = tp[..., 0], tp[..., 1], tp[..., 2]
         xc = 0.5 * (px[uv].min() + px[uv].max()); xh = 0.5 * (px[uv].max() - px[uv].min()) + 1e-9
         xfrac = (px - xc) / xh
         col = color_np.astype(np.float32)
+        _nw = 0; _na = 0
         for side in (-1, +1):
             a = xfrac * side
             arm = uv & (a > 0.30) & (a < 0.85)               # lateral arm, shoulder->wrist (skip hand/torso)
@@ -403,9 +405,10 @@ class FillUtils:
                     j = int(jb[np.argmin(np.abs(jb - b))]); cy[b] = cy[j]; cz[b] = cz[j]
             phi = np.degrees(np.arctan2(py - cy[xb], pz - cz[xb]))    # 0=front(+z)
             front = arm & (np.abs(phi) < 35)                  # the reliable front strip (camera-facing)
+            src_ok = front if covered is None else (front & covered)
             fc = np.zeros((n_bands, 3), np.float32); has = np.zeros(n_bands, bool)
             for b in range(n_bands):
-                fb = front & (xb == b)
+                fb = src_ok & (xb == b)
                 if int(fb.sum()) >= 5:
                     fc[b] = np.median(col[fb], 0); has[b] = True
             if not has.any():
@@ -415,8 +418,16 @@ class FillUtils:
                 if not has[b]:
                     j = int(jh[np.argmin(np.abs(jh - b))]); fc[b] = fc[j]
             fc = gaussian_filter1d(fc, 2.0, axis=0, mode='nearest')   # smooth along the arm length
-            color_np[arm] = np.clip(fc[xb[arm]], 0, 255).astype(np.uint8)
-        print("  [ArmWrap] wrapped the reliable front-arm colour over the whole arm (breast/torso untouched)")
+            # Write ONLY where the arm was never genuinely projected. With real side/back
+            # views the arm is largely covered for real, and overwriting it replaced each
+            # cross-band with a single flat median -> the visible arm smear. Unseen texels
+            # (arm top/back on a front-only run) still get the reliable front tone.
+            tgt = arm if covered is None else (arm & ~covered)
+            _nw += int(tgt.sum()); _na += int(arm.sum())
+            if tgt.any():
+                color_np[tgt] = np.clip(fc[xb[tgt]], 0, 255).astype(np.uint8)
+        print(f"  [ArmWrap] front-arm tone written to {_nw:,} UNSEEN arm texels "
+              f"of {_na:,} ({100.0 * _nw / max(_na, 1):.1f}%); really-projected arm left intact")
 
     # -------------------------------------------------------------------------
     # SEAM STITCH (user's idea, done in 3-D): a seam is the boundary between two UV

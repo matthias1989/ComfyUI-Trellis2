@@ -20,11 +20,125 @@ import node_helpers
 import hashlib
 import cv2
 import gc
+import time as _time_mod
 import copy
 
 import pymeshlab
 
 import cumesh as CuMesh
+
+# ── UV-chart tripwire ────────────────────────────────────────────────────────────────────────
+# cumesh clusters the mesh and hands every cluster to xatlas as its own chart; nothing on that
+# path compares the count to the atlas it must fit into. Measured on this pipeline, same node,
+# same 4096 atlas: 200,447 charts added in 0:14 and packed to 84 texels each, while 5,766,859
+# added in 9:51, cost ~15 minutes end to end, and packed to 2.9 texels each -- a micro-island
+# mosaic that cannot hold an eyelid. A chart needs roughly a 4x4 patch to be worth packing once
+# xatlas has spent a texel of padding around it, so the floor is texture_size**2 / 16 charts.
+# Above it the mesh is at fault, not the atlas: that many charts means the cone-angle clustering
+# could not merge neighbouring faces. Nothing is salvageable, so fail in seconds, not minutes.
+_CHART_MIN_TEXELS = 16                    # a 4x4 patch -- the smallest chart worth packing
+_CHART_GUARD = {"budget": None, "texture_size": None}   # set per call by the unwrap nodes
+
+def _dc_sane(v, scale):
+    """Reject a dual-contouring draw whose COORDINATES are destroyed, not just its face count.
+
+    The retry loop below guards on face-count ratio only. But this DC's documented failure mode
+    (see the comment there) is finishing "with vertex coordinates around 1e29 -- geometry
+    numerically destroyed". Such a draw can have a perfectly ordinary face count, so it sails past
+    the ratio guard, and then two things happen 20 minutes later and 400 lines away:
+
+      * xatlas cannot normalise a normal from it -> thousands of
+        "ASSERT: isNormalized(normal) xatlas.cpp 1263" lines that bury the console; and
+      * (pos - aabb[0]) / voxel_size lands astronomically out of range, which is an illegal
+        memory access inside grid_sample_3d and ABORTS the ComfyUI process -- losing the run,
+        the caches and the log with it.
+
+    Verified 2026-09-11: the raw sculpt is clean (full offline unwrap, 597,173 charts, zero
+    asserts, zero degenerate triangles), so the damage is introduced here, not by the generator.
+
+    The bound is deliberately loose. The DC is called with center 0 and scale*1.1, so its output
+    belongs within about +-0.55; past 2x the scale is not a slightly-off draw but a broken one.
+    """
+    if v is None or v.numel() == 0:
+        return False, "empty result"
+    finite = torch.isfinite(v)
+    if not bool(finite.all()):
+        return False, f"{int((~finite).any(dim=-1).sum()):,} non-finite vertices"
+    m = float(v.abs().max())
+    lim = float(scale) * 2.0
+    if m > lim:
+        return False, f"max |coord| {m:.3e}, limit {lim:.3f}"
+    return True, f"max |coord| {m:.4f}"
+
+
+def _safe_grid(pos, aabb, voxel_size, grid_size, where):
+    """Validate and repair the sample coordinates before they reach the CUDA kernel.
+
+    grid_sample_3d is a raw kernel with no bounds check, so ONE non-finite or out-of-range
+    coordinate is an illegal memory access -- which aborts the PROCESS. ComfyUI dies, the run is
+    lost, the caches with it, and the traceback names only the kernel, so there is nothing to
+    diagnose from. That cost two 30-minute bakes on 2026-09-11.
+
+    The bound is deliberately [0, grid_size], the volume itself, and NOT [0, grid_size - 1].
+    Healthy meshes routinely sample the outermost voxel band -- the good 2026-09-11 sculpt spans
+    -0.4997..0.4996, i.e. up to 1023.6 on a 1024 grid -- and those bakes work. A guard that
+    clamped at grid_size - 1 fired on 4 of 1000 healthy samples in testing and would have shifted
+    edge texels on EVERY bake. Only coordinates genuinely outside the volume are touched, so a
+    healthy bake is bit-identical to before.
+
+    `pos` is a barycentric combination of BVH triangle vertices, so it should already lie inside
+    the volume; outside means the BVH returned something wrong. Clamping puts such a sample at the
+    volume face, which is what sampling the volume means there. A non-finite one cannot be
+    repaired and is parked at the centre: one wrong texel instead of a dead bake. Everything is
+    counted and printed so the real cause shows up in the log.
+    """
+    g = (pos - aabb[0]) / voxel_size
+    gs = grid_size.to(device=g.device, dtype=g.dtype)
+    n = int(g.shape[0])
+    if n == 0:
+        print(f"[grid guard] {where}: EMPTY sample set -- nothing rasterised into the atlas")
+        return g.reshape(1, -1, 3)
+    finite = torch.isfinite(g).all(dim=-1)
+    n_bad = int((~finite).sum())
+    n_lo = int(((g < 0).any(dim=-1) & finite).sum())
+    n_hi = int(((g > gs).any(dim=-1) & finite).sum())
+    if n_bad or n_lo or n_hi:
+        fg = g[finite]
+        rng = ((fg.min(0).values.tolist(), fg.max(0).values.tolist())
+               if fg.numel() else (None, None))
+        print(f"[grid guard] {where}: {n:,} samples OUTSIDE the volume -- non-finite {n_bad:,}, "
+              f"below 0: {n_lo:,}, above {[round(v) for v in gs.tolist()]}: {n_hi:,}")
+        print(f"[grid guard]   finite range {rng[0]} .. {rng[1]}")
+        print(f"[grid guard]   repaired instead of letting the kernel abort the process")
+        g = torch.where(finite.unsqueeze(-1), g, gs * 0.5)
+        g = torch.clamp(g, torch.zeros_like(gs), gs)
+    return g.reshape(1, -1, 3)
+
+
+_cm_read_atlas_charts = CuMesh.CuMesh.read_atlas_charts
+
+
+def _cm_read_atlas_charts_guarded(self, *args, **kwargs):
+    out = _cm_read_atlas_charts(self, *args, **kwargs)
+    budget = _CHART_GUARD.get("budget")
+    if budget:
+        n = max(int(out[0]), 1)
+        ts = _CHART_GUARD.get("texture_size")
+        per = ts * ts / float(n)
+        if n > budget:
+            raise RuntimeError(
+                f"CHART TRIPWIRE: clustering produced {n:,} charts for a {ts}x{ts} atlas -- "
+                f"{per:.1f} texels per chart, against the {_CHART_MIN_TEXELS} (a 4x4 patch) "
+                f"needed to hold any detail. Packing this many takes ~15 minutes and the atlas "
+                f"comes out a micro-island mosaic. The mesh is the problem, not the atlas: this "
+                f"many charts means the cone-angle clustering could not merge neighbouring "
+                f"faces, so the surface is noise. Aborting before the unwrap instead of after."
+            )
+        print(f"[chart guard] {n:,} charts, {per:.0f} texels each (budget {budget:,})")
+    return out
+
+
+CuMesh.CuMesh.read_atlas_charts = _cm_read_atlas_charts_guarded
 import o_voxel
 
 import meshlib.mrmeshnumpy as mrmeshnumpy
@@ -870,6 +984,14 @@ class Trellis2ExportMesh:
                 "character_name": ("STRING", {"default": "",
                                               "tooltip": "When set, saves to output/characters/{character_name}/ "
                                                          "and ignores filename_prefix. Type the character image name here."}),
+                # A SOCKET (forceInput), deliberately not a widget: adding a widget would change
+                # widgets_values on every existing ExportMesh node and the saved graph would
+                # refuse to load. Wire Run Paths here so the file lands in this run's folder
+                # instead of a path typed into a widget that drifts out of date.
+                "path_prefix": ("STRING", {"forceInput": True,
+                                "tooltip": "Output prefix relative to the output folder, e.g. "
+                                           "characters/<char>/run_<stamp>/TRELLIS_TEXTURED. "
+                                           "Overrides filename_prefix and character_name."}),
             }
         }
 
@@ -879,7 +1001,13 @@ class Trellis2ExportMesh:
     CATEGORY = "Trellis2Wrapper"
     OUTPUT_NODE = True
 
-    def process(self, trimesh, filename_prefix, file_format, character_name=""):
+    def process(self, trimesh, filename_prefix, file_format, character_name="",
+                path_prefix=""):
+        pp = (path_prefix or "").strip()
+        if pp:
+            filename_prefix = pp.replace("\\", "/").lstrip("/")
+            print(f"[ExportMesh] path_prefix -> {filename_prefix}")
+            character_name = ""
         # If character_name is supplied, override prefix → output/characters/{name}/
         char = (character_name or "").strip()
         if char:
@@ -1135,7 +1263,7 @@ class Trellis2UnWrapAndRasterizer:
                 attr_volume,
                 torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
                 shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-                grid=((out_vertices - aabb[0]) / voxel_size).reshape(1, -1, 3),
+                grid=_safe_grid(out_vertices, aabb, voxel_size, grid_size, "vertex bake"),
                 mode='trilinear',
             )
             
@@ -1199,6 +1327,8 @@ class Trellis2UnWrapAndRasterizer:
             placeholder_texture = pil2tensor(Image.new('RGBA', (1, 1), (0, 0, 0, 0)))
             return (textured_mesh, placeholder_texture, placeholder_texture,)        
         
+        _CHART_GUARD.update(budget=(texture_size * texture_size) // _CHART_MIN_TEXELS,
+                            texture_size=texture_size)
         print('Unwrapping ...')        
         out_vertices, out_faces, out_uvs, out_vmaps = cumesh.uv_unwrap(
             compute_charts_kwargs={
@@ -1256,7 +1386,7 @@ class Trellis2UnWrapAndRasterizer:
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            grid=_safe_grid(valid_pos, aabb, voxel_size, grid_size, "texture bake"),
             mode='trilinear',
         )      
         
@@ -1719,7 +1849,8 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
         cumesh = CuMesh.CuMesh()
         cumesh.init(vertices, faces)
         print(f"Current vertices: {cumesh.num_vertices}, faces: {cumesh.num_faces}")        
-            
+        _pre_remesh_faces = int(cumesh.num_faces)
+
         pbar.update(1)
             
         print("Cleaning mesh...")        
@@ -1767,18 +1898,42 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
                 resolution = int(dual_contouring_resolution)
             
             print('Performing Dual Contouring ...')
-            # Perform Dual Contouring remeshing (rebuilds topology)
-            cumesh.init(*CuMesh.remeshing.remesh_narrow_band_dc_quad(
-                vertices, faces,
-                center = center,
-                scale = scale * 1.1, # old calculation : (resolution + 3 * remesh_band) / resolution * scale,
-                resolution = resolution,
-                band = remesh_band,
-                project_back = remesh_project, # Snaps vertices back to original surface
-                verbose = True,
-                remove_inner_faces = remove_inner_faces,
-                #bvh = bvh,
-            ))
+            # Perform Dual Contouring remeshing (rebuilds topology).
+            # BLOW-UP FALLBACK: DC normally lands near 1.5x the input face count and was
+            # bit-identical across every single-view bake (2,993,958 -> 4,629,724, three runs).
+            # Multi-view conditioning raises the variance: one bake produced 27,039,966 faces
+            # from 2,784,426 (9.7x), which then had 8,398 boundary loops, stalled the meshlib
+            # filler 20+ min, and came out with vertex coordinates around 1e29 -- geometry
+            # numerically destroyed, whole bake wasted. Everything here is decimated to ~135k
+            # regardless, so on that path a lower-resolution DC is strictly better than a
+            # self-destroying one. Normal bakes never enter the retry.
+            _dc_res = resolution
+            for _dc_try in range(3):
+                cumesh.init(*CuMesh.remeshing.remesh_narrow_band_dc_quad(
+                    vertices, faces,
+                    center = center,
+                    scale = scale * 1.1,
+                    resolution = _dc_res,
+                    band = remesh_band,
+                    project_back = remesh_project, # Snaps vertices back to original surface
+                    verbose = True,
+                    remove_inner_faces = remove_inner_faces,
+                    #bvh = bvh,
+                ))
+                _ratio = cumesh.num_faces / max(_pre_remesh_faces, 1)
+                print(f"[Remesh] dual contouring @{_dc_res}: {_pre_remesh_faces:,} -> "
+                      f"{cumesh.num_faces:,} faces ({_ratio:.2f}x input)")
+                _max_dc = int(os.environ.get("TRELLIS_MAX_DC_FACES", "12000000"))
+                if (_ratio <= 4.0 and len(_out_f) <= _max_dc) or _dc_res <= 256:
+                    break
+                _dc_res = max(256, _dc_res // 2)
+                print("=" * 78)
+                print(f"[Remesh] *** DUAL CONTOURING BLOW-UP {_ratio:.1f}x input (normal ~1.5x) -- "
+                      f"retrying at resolution {_dc_res} ***")
+                print("=" * 78)
+            if _ratio > 4.0:
+                print(f"[Remesh] *** still {_ratio:.1f}x at resolution {_dc_res} -- this bake's "
+                      f"geometry is suspect, check it before trusting the result ***")
             
             new_vertices, new_faces = cumesh.read()
             
@@ -1789,6 +1944,9 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
                 cumesh.init(new_vertices, new_faces)                    
             
             print(f"After remeshing: {cumesh.num_vertices} vertices, {cumesh.num_faces} faces")
+            _tw_v, _tw_f = cumesh.read()
+            _hole_tripwire("after remesh", _tw_v.cpu().numpy(), _tw_f.cpu().numpy())
+            del _tw_v, _tw_f
 
             if simplify_method == 'Cumesh':
                 cumesh.simplify(target_face_num, verbose=True)
@@ -1799,6 +1957,9 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
                 cumesh.init(torch.from_numpy(new_vertices).float().cuda(), torch.from_numpy(new_faces).int().cuda())
 
             print(f"After simplifying: {cumesh.num_vertices} vertices, {cumesh.num_faces} faces")            
+            _tw_v, _tw_f = cumesh.read()
+            _hole_tripwire("after simplify", _tw_v.cpu().numpy(), _tw_f.cpu().numpy())
+            del _tw_v, _tw_f
             pbar.update(1)
             
         if fill_holes:
@@ -1815,7 +1976,20 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
                 
                 last_reported_percent = -1  # Initialize at -1 to ensure 0% triggers an update
                 
+                _hf_budget = float(os.environ.get("TRELLIS_HOLEFILL_SECONDS", "90"))
+                _hf_t0 = _time_mod.time()
+                _hf_stopped = 0
                 for i, e in enumerate(hole_edges):
+                    # Hard time box. 7,065 holes at ~20/s is ~6 minutes, and a mesh with thousands
+                    # of holes is broken anyway -- filling every one does not rescue it, it just
+                    # makes the bake unaffordable. Fill what fits in the budget, then say so.
+                    if _hf_budget > 0 and (_time_mod.time() - _hf_t0) > _hf_budget:
+                        _hf_stopped = nb_holes - i
+                        print(f"[HoleFill] *** TIME BUDGET {_hf_budget:.0f}s reached after "
+                              f"{i}/{nb_holes} holes -- {_hf_stopped} left unfilled. A mesh with "
+                              f"this many holes is suspect; raise TRELLIS_HOLEFILL_SECONDS to "
+                              f"force it. ***")
+                        break
                     params = mrmeshpy.FillHoleParams()
                     params.metric = mrmeshpy.getUniversalMetric(meshlib_mesh)
                     mrmeshpy.fillHole(meshlib_mesh, e, params)
@@ -1869,7 +2043,7 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
                 attr_volume,
                 torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
                 shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-                grid=((mapped_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+                grid=_safe_grid(mapped_pos, aabb, voxel_size, grid_size, "vertex bake (mapped)"),
                 mode='trilinear',
             )
             
@@ -1935,6 +2109,8 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
             return (textured_mesh, placeholder_texture, placeholder_texture,)
         
         # --- Standard texture baking path ---
+        _CHART_GUARD.update(budget=(texture_size * texture_size) // _CHART_MIN_TEXELS,
+                            texture_size=texture_size)
         print('Unwrapping ...')        
         out_vertices, out_faces, out_uvs, out_vmaps = cumesh.uv_unwrap(
             compute_charts_kwargs={
@@ -1993,7 +2169,7 @@ class Trellis2PostProcessAndUnWrapAndRasterizer:
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            grid=_safe_grid(valid_pos, aabb, voxel_size, grid_size, "texture bake"),
             mode='trilinear',
         )
         
@@ -2162,19 +2338,94 @@ class Trellis2Remesh:
             resolution = int(dual_contouring_resolution)
         
         print('Performing Dual Contouring ...')
-        # Perform Dual Contouring remeshing (rebuilds topology)
-        vertices, faces = CuMesh.remeshing.remesh_narrow_band_dc(
-            vertices, faces,
-            center = center,
-            scale = scale * 1.1, # old calculation (resolution + 3 * remesh_band) / resolution * scale,
-            resolution = resolution,
-            band = remesh_band,
-            project_back = remesh_project, # Snaps vertices back to original surface
-            verbose = True,
-            # remove_inner_faces not supported in this CuMesh version
-            #bvh = bvh,
-        )
-        
+        # Perform Dual Contouring remeshing (rebuilds topology).
+        # BLOW-UP FALLBACK: DC normally lands near 1.5x the input face count and was
+        # bit-identical across every single-view bake (2,993,958 -> 4,629,724, three runs).
+        # Multi-view conditioning raises the variance: bakes produced 27,039,966 faces from
+        # 2,784,426 (9.7x) and 23,367,372 from 2,349,148 (9.9x). That path then had thousands
+        # of boundary loops, stalled the hole filler for 20+ min, and finished with vertex
+        # coordinates around 1e29 -- geometry numerically destroyed, whole bake wasted.
+        # Everything here is decimated to ~135k regardless, so on that path a lower-resolution
+        # DC is strictly better than a self-destroying one. Normal bakes never retry.
+        # Keep the ORIGINAL input so a retry re-remeshes the source, not the blown-up result.
+        # The failed attempt MUST be released first: holding the input + a 23M-face result +
+        # the new allocation at once OOMs a 16GB card (measured: 15.63 GiB held, 10.16 GiB
+        # requested, 15.92 GiB limit). One attempt at a time fits; two do not.
+        _in_v, _in_f = vertices, faces
+        _in_faces = int(len(faces))
+        _dc_res = resolution
+        _ratio = 0.0
+        _out_v = _out_f = None
+        for _dc_try in range(3):
+            if _out_v is not None:                     # drop the previous attempt before re-allocating
+                del _out_v, _out_f
+                _out_v = _out_f = None
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            _out_v, _out_f = CuMesh.remeshing.remesh_narrow_band_dc(
+                _in_v, _in_f,
+                center = center,
+                scale = scale * 1.1,
+                resolution = _dc_res,
+                band = remesh_band,
+                project_back = remesh_project, # Snaps vertices back to original surface
+                verbose = True,
+                # remove_inner_faces not supported in this CuMesh version
+                #bvh = bvh,
+            )
+            _ratio = len(_out_f) / max(_in_faces, 1)
+            print(f"[Remesh] dual contouring @{_dc_res}: {_in_faces:,} -> {len(_out_f):,} faces "
+                  f"({_ratio:.2f}x input)")
+            # Ratio alone is the wrong guard: 2.34x of a 2.8M-face input is 6.5M faces, which
+            # sails past a 4x check and then costs ~6 min of hole filling -- for a mesh that gets
+            # decimated to ~150k regardless. Bound the ABSOLUTE count too.
+            _max_dc = int(os.environ.get("TRELLIS_MAX_DC_FACES", "12000000"))
+            _dc_ok, _dc_why = _dc_sane(_out_v, scale)
+            print(f"[Remesh] coordinate check: {_dc_why}")
+            if not _dc_ok:
+                # A destroyed draw, not an over-dense one. This DC is nondeterministic,
+                # so the answer is another draw at the SAME resolution -- halving it
+                # would throw away detail to fix something that is not a resolution
+                # problem.
+                print("=" * 78)
+                print(f"[Remesh] *** DUAL CONTOURING PRODUCED BROKEN GEOMETRY ({_dc_why}) -- "
+                      f"redrawing at the same resolution {_dc_res} ***")
+                print("=" * 78)
+                continue
+            if (_ratio <= 4.0 and len(_out_f) <= _max_dc) or _dc_res <= 256:
+                if len(_out_f) > _max_dc:
+                    print(f"[Remesh] *** {len(_out_f):,} faces exceeds the {_max_dc:,} budget but "
+                          f"resolution is already {_dc_res} -- proceeding, expect a slow bake ***")
+                break
+            if len(_out_f) > _max_dc and _ratio <= 4.0:
+                print(f"[Remesh] *** {len(_out_f):,} faces over the {_max_dc:,} budget "
+                      f"({_ratio:.2f}x input) -- retrying lower rather than paying for it ***")
+            _dc_res = max(256, _dc_res // 2)
+            print("=" * 78)
+            print(f"[Remesh] *** DUAL CONTOURING BLOW-UP {_ratio:.1f}x input (normal ~1.5x) -- "
+                  f"retrying at resolution {_dc_res} ***")
+            print("=" * 78)
+        _dc_ok, _dc_why = _dc_sane(_out_v, scale)
+        if not _dc_ok:
+            raise RuntimeError(
+                f"Dual contouring produced unusable geometry on every attempt ({_dc_why}). "
+                f"This is the nondeterministic DC draw, not a setting -- re-queue and it will "
+                f"very likely succeed. Failing here costs minutes; letting it through aborts "
+                f"the ComfyUI process at the texture bake and costs the whole run.")
+        vertices, faces = _out_v, _out_f
+        del _in_v, _in_f, _out_v, _out_f
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        if _ratio > 4.0:
+            print(f"[Remesh] *** still {_ratio:.1f}x at resolution {_dc_res} -- geometry is "
+                  f"suspect, check this bake before trusting it ***")
+
         if remove_floaters:
             vertices, faces = remove_floater2(vertices.cpu().numpy(),faces.cpu().numpy())
             vertices = torch.from_numpy(vertices).contiguous().float()
@@ -3066,13 +3317,50 @@ class Trellis2FillHolesWithMeshlib:
         nb_holes = len(hole_edges)
         print(f"{nb_holes} holes found")
 
+        # A hole is a LOCAL defect. A boundary loop bigger around than the object itself is not
+        # a hole, it is the surface being open, and triangulating one destroys the bake: measured
+        # 2026-09-10 on a dual-contouring blow-up, loops with a median perimeter of 0.0046 on a
+        # body about 1 unit across and a single loop at 2.7893. Filling it took the mesh from
+        # 4,302,582 to 9,243,137 faces and left vertex coordinates at 2.8e11.
+        #
+        # The bound is the mesh's own bounding-box diagonal -- nothing to tune, and the worst
+        # hole any healthy bake produced was 0.1912 against a diagonal near 1.5.
+        _hf_per = []
+        _hf_diag = 0.0
+        _hf_skip = set()
+        try:
+            _hf_V = mesh_copy.vertices.detach().cpu().numpy()
+            _hf_diag = float(np.linalg.norm(_hf_V.max(axis=0) - _hf_V.min(axis=0)))
+            _hf_per = [float(mrmeshpy.holePerimeter(mesh.topology, mesh.points, _e))
+                       for _e in hole_edges]
+            _hf_skip = {_i for _i, _p in enumerate(_hf_per) if _p > _hf_diag}
+            if _hf_skip:
+                print(f"[HoleFill] *** skipping {len(_hf_skip)} loop(s) bigger around than the "
+                      f"mesh itself (bbox diagonal {_hf_diag:.4f}, largest loop "
+                      f"{max(_hf_per):.4f}) -- open boundary, not holes; filling them wrecks "
+                      f"the geometry ***")
+        except Exception as _hfe:
+            print(f"[HoleFill] hole-size guard unavailable ({_hfe!r}) - filling everything")
+            _hf_skip = set()
+
         if nb_holes > 0:
             progress_bar = tqdm(total=nb_holes, desc="Filling holes")
+            _hf_budget = float(os.environ.get("TRELLIS_HOLEFILL_SECONDS", "90"))
+            _hf_t0 = _time_mod.time()
             pbar = ProgressBar(nb_holes)
             
             last_reported_percent = -1  # Initialize at -1 to ensure 0% triggers an update
             
             for i, e in enumerate(hole_edges):                
+                if i in _hf_skip:          # bigger around than the whole mesh
+                    continue
+                # Hard time box: thousands of holes means the mesh is broken, and
+                # filling them one at a time costs minutes without rescuing it.
+                if _hf_budget > 0 and (_time_mod.time() - _hf_t0) > _hf_budget:
+                    print("[HoleFill] *** TIME BUDGET %.0fs reached after %d/%d holes"
+                          " -- rest left unfilled (TRELLIS_HOLEFILL_SECONDS to raise)"
+                          % (_hf_budget, i, nb_holes))
+                    break
                 params = mrmeshpy.FillHoleParams()
                 params.metric = mrmeshpy.getUniversalMetric(mesh)
                 mrmeshpy.fillHole(mesh, e, params)
@@ -3140,13 +3428,50 @@ class Trellis2FillHolesNicelyWithMeshlib:
         nb_holes = len(hole_edges)
         print(f"{nb_holes} holes found")
 
+        # A hole is a LOCAL defect. A boundary loop bigger around than the object itself is not
+        # a hole, it is the surface being open, and triangulating one destroys the bake: measured
+        # 2026-09-10 on a dual-contouring blow-up, loops with a median perimeter of 0.0046 on a
+        # body about 1 unit across and a single loop at 2.7893. Filling it took the mesh from
+        # 4,302,582 to 9,243,137 faces and left vertex coordinates at 2.8e11.
+        #
+        # The bound is the mesh's own bounding-box diagonal -- nothing to tune, and the worst
+        # hole any healthy bake produced was 0.1912 against a diagonal near 1.5.
+        _hf_per = []
+        _hf_diag = 0.0
+        _hf_skip = set()
+        try:
+            _hf_V = mesh_copy.vertices.detach().cpu().numpy()
+            _hf_diag = float(np.linalg.norm(_hf_V.max(axis=0) - _hf_V.min(axis=0)))
+            _hf_per = [float(mrmeshpy.holePerimeter(mesh.topology, mesh.points, _e))
+                       for _e in hole_edges]
+            _hf_skip = {_i for _i, _p in enumerate(_hf_per) if _p > _hf_diag}
+            if _hf_skip:
+                print(f"[HoleFill] *** skipping {len(_hf_skip)} loop(s) bigger around than the "
+                      f"mesh itself (bbox diagonal {_hf_diag:.4f}, largest loop "
+                      f"{max(_hf_per):.4f}) -- open boundary, not holes; filling them wrecks "
+                      f"the geometry ***")
+        except Exception as _hfe:
+            print(f"[HoleFill] hole-size guard unavailable ({_hfe!r}) - filling everything")
+            _hf_skip = set()
+
         if nb_holes > 0:
             progress_bar = tqdm(total=nb_holes, desc="Filling holes")
+            _hf_budget = float(os.environ.get("TRELLIS_HOLEFILL_SECONDS", "90"))
+            _hf_t0 = _time_mod.time()
             pbar = ProgressBar(nb_holes)
             
             last_reported_percent = -1  # Initialize at -1 to ensure 0% triggers an update
             
             for i, e in enumerate(hole_edges):          
+                if i in _hf_skip:          # bigger around than the whole mesh
+                    continue
+                # Hard time box: thousands of holes means the mesh is broken, and
+                # filling them one at a time costs minutes without rescuing it.
+                if _hf_budget > 0 and (_time_mod.time() - _hf_t0) > _hf_budget:
+                    print("[HoleFill] *** TIME BUDGET %.0fs reached after %d/%d holes"
+                          " -- rest left unfilled (TRELLIS_HOLEFILL_SECONDS to raise)"
+                          % (_hf_budget, i, nb_holes))
+                    break
                 params = mrmeshpy.FillHoleNicelySettings()
                 params.triangulateParams.metric = mrmeshpy.getMinAreaMetric(mesh)
                 params.smoothCurvature = False
@@ -3384,10 +3709,19 @@ class Trellis2BatchSimplifyMeshAndExport:
 
                     if nb_holes > 0:
                         progress_bar = tqdm(total=nb_holes, desc="Filling holes")
+                        _hf_budget = float(os.environ.get("TRELLIS_HOLEFILL_SECONDS", "90"))
+                        _hf_t0 = _time_mod.time()
                         
                         last_reported_percent = -1  # Initialize at -1 to ensure 0% triggers an update
                         
                         for i, e in enumerate(hole_edges):
+                            # Hard time box: thousands of holes means the mesh is broken, and
+                            # filling them one at a time costs minutes without rescuing it.
+                            if _hf_budget > 0 and (_time_mod.time() - _hf_t0) > _hf_budget:
+                                print("[HoleFill] *** TIME BUDGET %.0fs reached after %d/%d holes"
+                                      " -- rest left unfilled (TRELLIS_HOLEFILL_SECONDS to raise)"
+                                      % (_hf_budget, i, nb_holes))
+                                break
                             params = mrmeshpy.FillHoleParams()
                             params.metric = mrmeshpy.getUniversalMetric(mmesh)
                             mrmeshpy.fillHole(mmesh, e, params)
@@ -3517,7 +3851,99 @@ class Trellis2StringSelector:
         
         return (string,)
 
-def _holefill_report(m, thr):
+def _dev_reload_projection():
+    """Re-read the projection modules from disk before texturing.
+
+    Editing a projection .py normally needs a ComfyUI restart to take effect, and a restart
+    wipes ComfyUI's node cache -- which forces the whole ~7 min geometry/gen_seams chain and
+    the ~3 min Qwen pass to re-run just to test a texturing change. Reloading here means a
+    texture-side edit needs only a re-queue: everything upstream stays cached and only this
+    node re-executes. Dependencies are reloaded before the module that imports them.
+    """
+    import importlib
+    import sys as _s
+    for _name in ('camera_utils', 'normal_map_utils', 'uv_island_diag',
+                  'face_detection_utils', 'hair_detection_utils_v2',
+                  'feature_anchor_warp', 'landmark_warp', 'fill_utils',
+                  'texture_projection_multiview'):
+        _sfx = '.projection.' + _name
+        for _k in [k for k in list(_s.modules) if k.endswith(_sfx)]:
+            try:
+                importlib.reload(_s.modules[_k])
+            except Exception as _e:
+                print(f"[dev-reload] {_name}: {_e!r}")
+
+
+# --- hole tripwire ---------------------------------------------------------------------------
+_HOLE_HISTORY = []
+
+
+def _boundary_edges(V, F):
+    """Edges used by exactly one face. Zero on a closed mesh.
+
+    One np.unique on an int64 key rather than unique(axis=0), which is an order of magnitude
+    slower on the ~16M edges of a five-million-face mesh.
+    """
+    import numpy as _np
+    e = _np.sort(_np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+    key = e[:, 0].astype(_np.int64) * _np.int64(len(V)) + e[:, 1].astype(_np.int64)
+    _, cnt = _np.unique(key, return_counts=True)
+    return int((cnt == 1).sum())
+
+
+def _hole_tripwire(stage, V, F, jump=5.0, reset=False):
+    """Count the boundary at `stage` and shout if a step has just torn the mesh open.
+
+    2026-09-11: a bake handed 20,075 holes to the meshlib filler, which burned its 90 s budget
+    on 1,742 of them. The same failure is recorded in this file from an earlier bake (2,527 ->
+    8,398). Both times a human found it in the log after the damage, and both times the useful
+    question -- WHICH step tore the holes -- could not be answered, because the only two counts
+    came from different nodes with a dual-contouring remesh and a simplify in between.
+
+    Restarting the server made it go away on the same character with the same cached views and
+    the same cached sculpt, so suspect process state rather than the input.
+
+    The threshold is RELATIVE -- a multiple of the smallest count seen this bake -- because a
+    mesh legitimately has some boundary and what matters is a step suddenly making far more of
+    it. Diagnostic only: never raises. TRELLIS_HOLE_TRIPWIRE=0 turns it off.
+    """
+    global _HOLE_HISTORY
+    import os as _os
+    if _os.environ.get("TRELLIS_HOLE_TRIPWIRE", "1") == "0":
+        return -1
+    try:
+        import time as _t
+        if reset:
+            _HOLE_HISTORY = []
+        t0 = _t.time()
+        n = _boundary_edges(V, F)
+        prev = min([c for _, c in _HOLE_HISTORY], default=None)
+        _HOLE_HISTORY.append((stage, n))
+        note = ""
+        if prev is not None and prev > 0 and n > prev * jump:
+            note = "%.0fx the %d seen earlier" % (n / max(prev, 1), prev)
+        elif prev == 0 and n > 0:
+            note = "the mesh was CLOSED before this step"
+        print("[HoleWire] %-18s %8d boundary edge(s)%s   (%.1fs)"
+              % (stage, n, ("  <-- " + note) if note else "", _t.time() - t0), flush=True)
+        if note:
+            print("=" * 78, flush=True)
+            print("[HoleWire] *** %s TORE THE MESH OPEN: %s ***" % (stage.upper(), note), flush=True)
+            print("[HoleWire] trail: " + " -> ".join("%s %d" % (a, b) for a, b in _HOLE_HISTORY),
+                  flush=True)
+            print("[HoleWire] This is process state, not the input: the same character with "
+                  "the same cached sculpt came out clean on a fresh server. The bake is NOT "
+                  "blocked -- the hole fill is time-boxed and the run continues. Judge the "
+                  "result on its merits; if it is bad, a restarted server is the known cure, "
+                  "and the FIRST bake after a restart is the trustworthy one.", flush=True)
+            print("=" * 78, flush=True)
+        return n
+    except Exception as _e:
+        print("[HoleWire] %s skipped (%r)" % (stage, _e), flush=True)
+        return -1
+
+
+def _holefill_report(m, thr, tag='pre'):
     """Print the boundary-loop PERIMETER distribution before filling.
 
     fill_holes only closes loops with perimeter <= max_hole_perimeter; whatever is left goes to
@@ -3535,7 +3961,7 @@ def _holefill_report(m, thr):
         uq, cnt = _np.unique(e, axis=0, return_counts=True)
         b = uq[cnt == 1]
         if len(b) == 0:
-            print("[HoleFill] no boundary edges (mesh already closed)", flush=True)
+            print(f"[HoleFill/{tag}] no boundary edges (mesh already closed)", flush=True)
             return
         n = len(V)
         g = _coo((_np.ones(len(b)), (b[:, 0], b[:, 1])), shape=(n, n))
@@ -3546,15 +3972,15 @@ def _holefill_report(m, thr):
         if not len(per):
             return
         q = _np.percentile(per, [50, 75, 90, 95, 99])
-        print(f"[HoleFill] {len(per)} boundary loops | perimeter med {q[0]:.4f} p75 {q[1]:.4f} "
+        print(f"[HoleFill/{tag}] {len(per)} boundary loops | perimeter med {q[0]:.4f} p75 {q[1]:.4f} "
               f"p90 {q[2]:.4f} p95 {q[3]:.4f} p99 {q[4]:.4f} max {per.max():.4f}", flush=True)
-        print(f"[HoleFill] threshold {thr}: fills {int((per <= thr).sum())}/{len(per)} "
+        print(f"[HoleFill/{tag}] threshold {thr}: fills {int((per <= thr).sum())}/{len(per)} "
               f"({100.0 * (per <= thr).mean():.1f}%), leaves {int((per > thr).sum())} for meshlib", flush=True)
         cover = "  ".join(f"{t:g}->{100.0 * (per <= t).mean():.0f}%" for t in
                           (0.03, 0.05, 0.1, 0.2, 0.4, 0.8))
-        print(f"[HoleFill] coverage by threshold: {cover}", flush=True)
+        print(f"[HoleFill/{tag}] coverage by threshold: {cover}", flush=True)
     except Exception as _e:
-        print(f"[HoleFill] report skipped ({_e!r})", flush=True)
+        print(f"[HoleFill/{tag}] report skipped ({_e!r})", flush=True)
 
 
 class Trellis2FillHolesWithCuMesh:
@@ -3578,7 +4004,14 @@ class Trellis2FillHolesWithCuMesh:
         mesh_copy = copy.deepcopy(mesh)
         _holefill_report(mesh_copy, max_permieters)
         mesh_copy.fill_holes(max_hole_perimeter = max_permieters)
-        
+        # VERIFY. The report above only PREDICTS from the perimeter distribution; it never
+        # checked the result. One bake printed "fills 2527/2527 (100.0%), leaves 0 for meshlib"
+        # and then handed 8,398 holes to the meshlib filler, which took 20+ minutes. Count the
+        # boundary loops that actually remain, so the log can never claim a clean fill again.
+        _holefill_report(mesh_copy, max_permieters, tag='post')
+        _hole_tripwire("after fill_holes",
+                       mesh_copy.vertices.detach().cpu().numpy(),
+                       mesh_copy.faces.detach().cpu().numpy(), reset=True)
         return (mesh_copy,)         
 
 class Trellis2LaplacianSmoothingWithOpen3d:
@@ -4401,6 +4834,24 @@ class Trellis2SimplifyTrimeshAdvanced:
         return (mesh_copy,)
 
 class Trellis2MultiViewTexturing:
+    # ── Re-run when the projection source changes (see _dev_reload_projection) ───
+    # ComfyUI caches by node INPUTS and cannot see a .py edit, so a texturing fix would
+    # be skipped entirely on a re-queue. Hashing the projection modules' mtimes marks
+    # THIS node dirty and leaves the ~7 min geometry chain and ~3 min Qwen pass cached.
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        import os as _o
+        _d = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "projection")
+        _mods = ("texture_projection_multiview.py", "fill_utils.py",
+                 "hair_detection_utils_v2.py", "face_detection_utils.py",
+                 "feature_anchor_warp.py", "landmark_warp.py",
+                 "normal_map_utils.py", "camera_utils.py")
+        try:
+            return str([(m, _o.path.getmtime(_o.path.join(_d, m)))
+                        for m in _mods if _o.path.exists(_o.path.join(_d, m))])
+        except Exception:
+            return float("nan")
+
     """
     Apply texture to mesh by projecting multiple view images.
     
@@ -4691,6 +5142,7 @@ class Trellis2MultiViewTexturing:
         dump_stages=True,
         fast_skin_fill=True,
     ):
+        _dev_reload_projection()
         from .projection.texture_projection_multiview import texture_mesh_with_multiview
 
         # Parse debug_color string "R,G,B" → tuple, or None for normal operation
@@ -4993,6 +5445,7 @@ class Trellis2ProjectHighPolyToLowPoly:
         custom_weights="",
         camera_config = None,
     ):
+        _dev_reload_projection()
         from .projection.texture_projection_multiview import texture_mesh_with_multiview
         
         reset_cuda()

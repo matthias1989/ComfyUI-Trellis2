@@ -46,6 +46,8 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import nvdiffrast.torch as dr
+
+_GENSEAMS_VIZ = ('C:/applications/ComfyUI_windows_portable_nvidia/ComfyUI_windows_portable/ComfyUI/uv_transfer/_genseams_viz.npz')
 import cv2
 import trimesh
 import gc
@@ -123,6 +125,322 @@ def project_texels_to_image(tex_pos, right, up, ortho_scale):
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def fit_view_scale_offset(verts_np, az_deg, el_deg, fg_mask, tag="", lower_frac=0.55, ds=4):
+    """Recover a view's SCALE and POSITION when its silhouette is cropped.
+
+    The standard fit is  pix_per_clip = img_char_h / mesh_v_span  with the mesh centred on the
+    silhouette's bbox midpoint. Both inputs are wrong when the figure runs off the top and bottom
+    of the frame, which every generated side view does (bbox y[0,1023]): the height is truncated,
+    so the scale is too small, and the midpoint of a truncated silhouette is not the body's
+    midpoint, so the position is off. Measured symptoms: the ear and the hand land too high on the
+    side views, and the chest projects past the profile's forward edge.
+
+    Fits ONE uniform scale and ONE offset for the whole view by maximising silhouette overlap.
+    This is deliberately NOT the per-row correction that was tried and rejected: a similarity
+    transform has no per-scanline component, so it cannot band the hair.
+
+    Fitted on the LOWER body only (mesh height below `lower_frac`, image rows below the matching
+    line). Hair dominates the upper silhouette and mesh hair differs from generated hair, so
+    including it would drag the fit; the torso and legs are where the two actually agree.
+    Returns (scale, dx, dy) -- (1.0, 0, 0) when the silhouette is not cropped or the fit fails.
+    """
+    H, W = fg_mask.shape[:2]
+    ys, xs = np.nonzero(fg_mask)
+    if len(ys) < 200:
+        return 1.0, 0.0, 0.0
+    y0, y1 = int(ys.min()), int(ys.max())
+    if y0 > 0 and y1 < H - 1:
+        return 1.0, 0.0, 0.0                       # uncropped: existing fit is sound, leave it
+    ich = float(y1 - y0 + 1); icx = float(xs.mean()); icy = float(y0 + y1) / 2.0
+
+    azr = math.radians(float(az_deg)); elr = math.radians(float(el_deg))
+    cam = np.array([math.sin(azr) * math.cos(elr), math.sin(elr), math.cos(azr) * math.cos(elr)])
+    look = -cam
+    right = np.cross(look, np.array([0.0, 1.0, 0.0]))
+    nr = np.linalg.norm(right)
+    if nr < 1e-6:
+        return 1.0, 0.0, 0.0
+    right = right / nr
+    up = np.cross(right, look)
+    Vs = np.asarray(verts_np, dtype=np.float64)
+    hn = (Vs[:, 1] - Vs[:, 1].min()) / max(float(Vs[:, 1].max() - Vs[:, 1].min()), 1e-9)
+    low = hn < lower_frac
+    if int(low.sum()) < 500:
+        return 1.0, 0.0, 0.0
+    Vl = Vs[low]
+    if len(Vl) > 20000:
+        Vl = Vl[:: max(1, len(Vl) // 20000)]
+    u = Vl @ right; v = Vl @ up
+    vall = Vs @ up
+    mcx = float((Vs @ right).min() + (Vs @ right).max()) * 0.5
+    mcy = float(vall.min() + vall.max()) * 0.5
+    span = float(vall.max() - vall.min())
+    if span < 1e-9:
+        return 1.0, 0.0, 0.0
+    ppc = ich / span
+    X0 = icx + (u - mcx) * ppc
+    Y0 = icy - (v - mcy) * ppc
+
+    ycut = int(y0 + (1.0 - lower_frac) * (y1 - y0))
+    img = fg_mask.copy(); img[:max(ycut, 0)] = False
+    gh, gw = H // ds, W // ds
+    ig = img[:gh * ds, :gw * ds].reshape(gh, ds, gw, ds).any(axis=(1, 3))
+    ic = int(ig.sum())
+    if ic < 50:
+        return 1.0, 0.0, 0.0
+
+    def score(sc, dx, dy):
+        gx = np.clip(((icx + (X0 - icx) * sc + dx) / ds).astype(np.int32), 0, gw - 1)
+        gy = np.clip(((icy + (Y0 - icy) * sc + dy) / ds).astype(np.int32), 0, gh - 1)
+        m = np.zeros((gh, gw), bool); m[gy, gx] = True
+        inter = int((m & ig).sum())
+        return inter / float(ic + int(m.sum()) - inter + 1e-9)
+
+    best = (score(1.0, 0.0, 0.0), 1.0, 0.0, 0.0)
+    for sc in np.arange(0.80, 1.65, 0.05):
+        for dx in range(-40, 41, 8):
+            for dy in range(-80, 81, 8):
+                v_ = score(sc, dx, dy)
+                if v_ > best[0]:
+                    best = (v_, float(sc), float(dx), float(dy))
+    _, bs, bdx, bdy = best
+    for sc in np.arange(bs - 0.05, bs + 0.051, 0.01):
+        for dx in range(int(bdx) - 8, int(bdx) + 9, 2):
+            for dy in range(int(bdy) - 8, int(bdy) + 9, 2):
+                v_ = score(sc, dx, dy)
+                if v_ > best[0]:
+                    best = (v_, float(sc), float(dx), float(dy))
+    if best[1] <= 0.81 or best[1] >= 1.63:
+        print(f"[FitScale]{tag} optimum pinned at the search boundary (x{best[1]:.2f}) -- that is a "
+              f"degenerate fit, not a measurement; keeping the height-based fit")
+        return 1.0, 0.0, 0.0
+    print(f"[FitScale]{tag} silhouette cropped -> scale x{best[1]:.3f} dx={best[2]:+.0f} "
+          f"dy={best[3]:+.0f} (lower-body overlap {100*best[0]:.1f}%, was "
+          f"{100*score(1.0,0.0,0.0):.1f}%)")
+    return best[1], best[2], best[3]
+
+
+def _silhouette_iou(verts_np, az_deg, el_deg, fg_mask):
+    """Rasterise the mesh silhouette for a candidate camera and score it against the image's
+    own foreground. Uses the SAME centre+height fit the projector uses, so the number reflects
+    what the projection would actually do."""
+    ys, xs = np.nonzero(fg_mask)
+    if len(ys) < 100:
+        return 0.0
+    H, W = fg_mask.shape[:2]
+    y0, y1 = int(ys.min()), int(ys.max())
+    ich = float(y1 - y0 + 1); icx = float(xs.mean()); icy = float(y0 + y1) / 2.0
+    azr = math.radians(float(az_deg)); elr = math.radians(float(el_deg))
+    cam = np.array([math.sin(azr) * math.cos(elr), math.sin(elr), math.cos(azr) * math.cos(elr)])
+    look = -cam
+    right = np.cross(look, np.array([0.0, 1.0, 0.0]))
+    nrm = np.linalg.norm(right)
+    if nrm < 1e-6:
+        return 0.0
+    right = right / nrm
+    up = np.cross(right, look)
+    u = verts_np @ right; v = verts_np @ up
+    vs = float(v.max() - v.min())
+    if vs < 1e-9:
+        return 0.0
+    mcx = (u.min() + u.max()) * 0.5; mcy = (v.min() + v.max()) * 0.5
+    ppc = ich / vs
+    X = np.clip(np.round(icx + (u - mcx) * ppc).astype(np.int64), 0, W - 1)
+    Y = np.clip(np.round(icy - (v - mcy) * ppc).astype(np.int64), 0, H - 1)
+    m = np.zeros((H, W), dtype=bool); m[Y, X] = True
+    for _ in range(3):                      # close the vertex splat into a solid silhouette
+        m = m | np.roll(m, 1, 0) | np.roll(m, -1, 0) | np.roll(m, 1, 1) | np.roll(m, -1, 1)
+    return 100.0 * float((m & fg_mask).sum()) / max(float((m | fg_mask).sum()), 1.0)
+
+
+def build_silhouette_warp(vx, vy, fg_mask, smooth=9):
+    """Per-row correspondence between the MESH silhouette and the IMAGE silhouette.
+
+    The anchor warp needs detectable features (face, nipples, navel, arm centrelines) and is
+    therefore limited to near-front views. Side views get no correction at all, and they need one:
+    measured on a real bake, the mesh's chest projects 21px PAST the generated profile's forward
+    silhouette edge at upper chest, 9px at the nipple line. The generated character is simply
+    shallower front-to-back than the mesh. Those forward texels then sample background and are
+    dropped ("the side image stops too early"), while the texels just inside sample the shaded
+    silhouette rim and paint it at the wrong depth -- the misplaced second nipple.
+
+    A profile needs no feature detection: every row of the silhouette is a correspondence. This
+    returns a global vertical shift plus per-row forward/rear edge corrections, which is a far
+    denser fit than the 4-8 anchors the front view uses, and is purely relative.
+
+    Returns (dy, meshL, meshR, dxL, dxR, valid) as float32 arrays indexed by image row, or None.
+    """
+    H, W = fg_mask.shape[:2]
+    rows = np.arange(H)
+    # image silhouette extents per row
+    iL = np.full(H, np.nan); iR = np.full(H, np.nan)
+    _any = fg_mask.any(1)
+    if int(_any.sum()) < 20:
+        return None
+    idx = np.where(_any)[0]
+    iL[idx] = np.argmax(fg_mask[idx], axis=1)
+    iR[idx] = W - 1 - np.argmax(fg_mask[idx][:, ::-1], axis=1)
+
+    # per-row mesh extents, computed ONCE. A vertical shift of the mesh is just a roll of
+    # these arrays, so the dy search costs nothing extra.
+    yi = np.rint(vy).astype(np.int64)
+    ok = (yi >= 0) & (yi < H)
+    if int(ok.sum()) < 100:
+        return None
+    mL0 = np.full(H, np.inf); mR0 = np.full(H, -np.inf)
+    np.minimum.at(mL0, yi[ok], vx[ok])
+    np.maximum.at(mR0, yi[ok], vx[ok])
+    cnt = np.bincount(yi[ok], minlength=H)[:H]
+    base_valid = cnt > 4
+    mL0[~base_valid] = np.nan; mR0[~base_valid] = np.nan
+
+    def mesh_edges(shift):
+        return (np.roll(mL0, shift), np.roll(mR0, shift), np.roll(base_valid, shift))
+
+    # global vertical shift: maximise per-row interval overlap with the image silhouette
+    best = (None, 0)
+    for sh in range(-60, 61, 2):
+        mL, mR, mv = mesh_edges(sh)
+        v = mv & _any & ~np.isnan(mL)
+        if int(v.sum()) < 20:
+            continue
+        ov = np.minimum(mR[v], iR[v]) - np.maximum(mL[v], iL[v])
+        un = np.maximum(mR[v], iR[v]) - np.minimum(mL[v], iL[v])
+        score = float(np.clip(ov, 0, None).sum() / max(un.sum(), 1e-6))
+        if best[0] is None or score > best[0]:
+            best = (score, sh)
+    dy = int(best[1])
+    mL, mR, mv = mesh_edges(dy)
+    valid = mv & _any & ~np.isnan(mL) & ~np.isnan(iL)
+    if int(valid.sum()) < 20:
+        return None
+    dxL = np.zeros(H); dxR = np.zeros(H)
+    # DIRECTION: image - mesh. A texel whose mesh edge projects to mL must sample the image at
+    # iL, so the sample position moves by (iL - mL). Measured: with this sign the top view's edge
+    # correction was med 8.0px; with the sign flipped it became med 34.8px and coverage fell from
+    # 28% to 20% -- the flip doubled the error rather than cancelling it.
+    dxL[valid] = iL[valid] - mL[valid]
+    dxR[valid] = iR[valid] - mR[valid]
+    # smooth along y so a single ragged row cannot tear the projection
+    if smooth > 1:
+        k = np.ones(smooth) / smooth
+        for arr in (dxL, dxR):
+            arr[:] = np.convolve(arr, k, mode="same")
+
+    # TRUST TAPER. A row whose correction is close to the view's typical correction is a real
+    # measurement of a proportion difference; a row needing many times that is the mesh and the
+    # generated image disagreeing about what is even there -- which is the HAIR, where the first
+    # version applied 70px corrections against a median of 8px and smeared the back view into
+    # horizontal bands. Weight each row by med/|dx|, so corrections at or below the median pass
+    # through untouched and outliers fade out as 1/|dx|. Relative to the view's own median, so
+    # there is no constant and it adapts to any character.
+    _mag = np.maximum(np.abs(dxL), np.abs(dxR))
+    _sel = valid & (_mag > 0)
+    if int(_sel.sum()) > 10:
+        _med = float(np.median(_mag[_sel]))
+        if _med > 1e-6:
+            _w = np.clip(_med / np.maximum(_mag, _med), 0.0, 1.0)
+            _tamed = int((valid & (_w < 0.5)).sum())
+            dxL *= _w; dxR *= _w
+            print(f"[SilWarp] trust taper: median |dx|={_med:.1f}px; "
+                  f"{_tamed} rows damped below half (outliers, typically hair)")
+    mL = np.nan_to_num(mL); mR = np.nan_to_num(mR)
+    return (dy, mL.astype(np.float32), mR.astype(np.float32),
+            dxL.astype(np.float32), dxR.astype(np.float32), valid.astype(np.float32))
+
+
+def fit_view_azimuth(verts_np, az_declared, el_deg, fg_mask, tag=""):
+    """Decide whether a view's declared azimuth is on the correct SIDE of the character.
+
+    Measured on a real bake: the image generated as "left side view" matched the mesh at az=270
+    (IoU 73.7%) far better than at its declared az=90 (62.6%), and the "right side view" was the
+    same the other way (78.1% vs 64.2%). Every side view was therefore projecting the FRONT of
+    the body onto the BACK -- the face onto the back of the skull, the breasts onto the shoulder
+    blades. What a generator means by "left" is not guaranteed to match the projector's azimuth
+    convention, and it need not be the same for the next character, so measure it.
+
+    Only the MIRROR (360 - az) is considered. That is exactly the ambiguity being resolved, and
+    it means this can never turn a front view into a back one: 0 and 180 are their own mirrors
+    and are left alone by construction.
+    """
+    az = float(az_declared) % 360.0
+    mirror = (360.0 - az) % 360.0
+    if abs(((mirror - az + 180.0) % 360.0) - 180.0) < 1.0:
+        return az_declared                       # front/back: nothing to decide
+    _here = _silhouette_iou(verts_np, az, el_deg, fg_mask)
+    _mirr = _silhouette_iou(verts_np, mirror, el_deg, fg_mask)
+    if _mirr > _here + 3.0:                      # margin: only switch on a clear win
+        print(f"[AzFit]{tag} declared az={az:.0f} (silhouette IoU {_here:.1f}%) but az={mirror:.0f} "
+              f"fits better ({_mirr:.1f}%) -> using az={mirror:.0f}. The generated view is of the "
+              f"OPPOSITE side from the declared one.")
+        return mirror
+    print(f"[AzFit]{tag} az={az:.0f} confirmed (IoU {_here:.1f}% vs {_mirr:.1f}% mirrored)")
+    return az_declared
+
+
+def fit_view_elevation(verts_np, az_deg, el_declared, fg_mask, tag=""):
+    """Derive a view's TRUE elevation from its own silhouette, instead of trusting the
+    angle declared in the workflow.
+
+    A declared angle goes stale the moment the prompt or the reference image changes, and
+    it fails silently -- the projection just lands in the wrong place. This bit us twice:
+    a hardcoded 30 that was calibrated before the prompt gained "high angle shot", and then
+    a hand-derived 54.4 that was wrong because it modelled the silhouette height as
+    Sy*cos(el) and ignored the mesh's own depth. The true relation is
+
+        v_span(el) = extent of (y*cos(el) - z*sin(el))
+
+    so the depth term matters as soon as the camera tilts. Rather than encode that formula
+    (and get it wrong again), scan elevations and pick the one whose PROJECTED silhouette
+    aspect ratio matches the generated image's. Purely relative -- no constants, no tuning,
+    and it re-derives itself every bake.
+
+    Azimuth is trusted: it is what the prompt asks for and the silhouette does not constrain
+    it independently. Only the elevation is measured.
+    """
+    ys, xs = np.nonzero(fg_mask)
+    if len(ys) < 100:
+        return el_declared
+    H, W = fg_mask.shape[:2]
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    # A silhouette running off the top or bottom edge has an unknown true height, so the
+    # aspect ratio is meaningless. (This is exactly why the cropped BACK view measures as
+    # ~23 deg when it is really 0.) Keep the declared angle rather than fit to a lie.
+    if y0 <= 0 or y1 >= H - 1:
+        print(f"[ElFit]{tag} silhouette touches the frame edge — height unknown, "
+              f"keeping declared el={el_declared}")
+        return el_declared
+    r_img = float(x1 - x0 + 1) / float(max(y1 - y0 + 1, 1))
+
+    Vs = np.asarray(verts_np, dtype=np.float64)
+    if len(Vs) > 40000:                      # extents are broad regions; subsampling is safe
+        Vs = Vs[:: max(1, len(Vs) // 40000)]
+    azr = math.radians(float(az_deg))
+    best_err, best_el = None, el_declared
+    for cand in np.arange(0.0, 89.5, 0.5):
+        elr = math.radians(float(cand))
+        cam = np.array([math.sin(azr) * math.cos(elr), math.sin(elr),
+                        math.cos(azr) * math.cos(elr)])
+        look = -cam
+        right = np.cross(look, np.array([0.0, 1.0, 0.0]))
+        n = np.linalg.norm(right)
+        if n < 1e-6:
+            continue
+        right = right / n
+        up = np.cross(right, look)
+        u = Vs @ right
+        v = Vs @ up
+        v_span = float(v.max() - v.min())
+        if v_span < 1e-9:
+            continue
+        err = abs(float(u.max() - u.min()) / v_span - r_img)
+        if best_err is None or err < best_err:
+            best_err, best_el = err, float(cand)
+    print(f"[ElFit]{tag} declared el={el_declared} -> measured el={best_el:.1f} "
+          f"(silhouette aspect {r_img:.3f}, residual {best_err:.4f})")
+    return best_el
+
 
 def _normalize_verts(verts: torch.Tensor, norm_size: float = 1.15) -> torch.Tensor:
     """
@@ -220,7 +538,7 @@ def texture_mesh_with_multiview(
     legacy_fill: bool = False,
     # KAN-9 — feature-anchor warp. OFF (reverted to the known-good 84% baseline). The
     # warp + reclaim experiments are inert; do not re-enable until reworked carefully.
-    feature_anchor_warp: bool = False,
+    feature_anchor_warp: bool = True,   # residual per-anchor warp (nipple separation etc.)
     # KAN-9 — global feature-offset. OFF: it's a pixel band-aid — a uniform shift that
     # drags the WHOLE body to chase the features ("everything shifted"). The face is now
     # aligned per-feature by the landmark warp instead. The residual nipple offset is mesh
@@ -486,13 +804,94 @@ def texture_mesh_with_multiview(
 
     _anchor_field = None   # KAN-9 feature-anchor warp field (computed once, front view)
     _anchor_view  = -1
-    _g_offset = None       # KAN-9 global feature-offset (dx,dy), computed once, front view
+    _g_offset = None       # KAN-9 global feature-offset (dx,dy), per near-front view
     _g_offset_view = -1
-    for _view_i, (img, az, el, view_w) in (
-            enumerate(zip(images, azimuths, elevations, view_weights))
-            if not _skip_projection else []):
+    # KAN-9 / arms — the region offset and the anchor warp used to be computed ONCE, on the
+    # first near-front view, and applied only to that view (_view_i == _g_offset_view). The
+    # added top view (az=0, el~54) is also near-front, but arrived second, so it received
+    # NEITHER correction: its arm texels kept the raw uniform fit, landed ~31px above the
+    # photo's ~38px-thick arm, sampled background and were rejected -> magenta arm tops.
+    # Keyed per view now: every near-front view computes and applies its own fit.
+    _g_off_by_view = {}
+    _anchor_by_view = {}
+
+    # ── CROSS-VIEW EXPOSURE MATCH (on shared texels) ─────────────────────────
+    # Each view's exposure went into the blend untouched (fu.colour_correct runs once on the
+    # FINAL atlas, globally). Three horizontal views happened to agree, so it never showed;
+    # adding the top view exposed it. Measured on torso skin, like for like:
+    #     photo 0.573 | LEFT 0.663  RIGHT 0.682  BACK 0.643 | TOP 0.420   (HSV V)
+    # Hue (20-27 deg) and saturation (0.28-0.34) are already identical across every view, so
+    # this is purely a V error -- and a scalar RGB gain is the exact operator for it: it leaves
+    # hue untouched and leaves S = (max-min)/max unchanged, since both terms scale together.
+    #
+    # The gain is measured on the texels THIS VIEW AND THE REFERENCE VIEW BOTH SEE -- the same
+    # points on the body, so differing hair-to-skin ratios cancel out. Comparing whole frames
+    # does not work: the top view looks down on a lot of bright hair, which pulled its frame
+    # median up to 0.455 against skin's real 0.420 and under-corrected it to a ~1.09 gain when
+    # the skin needed ~1.36. No skin classifier, no thresholds, no constants.
+    # Index of the most front-on view (azimuth AND elevation nearest zero). Computed
+    # unconditionally and owned by nobody else: _front_view_idx is only assigned when
+    # face_front_only is enabled, and borrowing it silently disabled a fix once already.
+    _frontmost_i = -1
+    try:
+        _score = [abs(((float(_a) + 180.0) % 360.0) - 180.0) + abs(float(_e))
+                  for _a, _e in zip(azimuths, elevations)]
+        _frontmost_i = int(np.argmin(_score)) if _score else -1
+        if _frontmost_i >= 0:
+            print(f"[Exposure] reference = view {_frontmost_i} "
+                  f"(az={azimuths[_frontmost_i]}, el={elevations[_frontmost_i]})")
+    except Exception as _ee:
+        print(f"[Exposure] disabled ({_ee!r})")
+    # -- TRIPWIRE CONFIG (loaded up front so a bad VIEW can abort immediately, mid-loop,
+    #    instead of after all five views plus seam-hair plus the atlas pass) --
+    import os as _os_twc, json as _json_twc
+    _tw_on   = _os_twc.environ.get("TRELLIS_COVERAGE_ABORT", "1").strip() != "0"
+    _tw_path = _os_twc.path.join(_os_twc.path.dirname(_os_twc.path.dirname(_os_twc.path.dirname(
+        _os_twc.path.dirname(_os_twc.path.abspath(__file__))))), "uv_transfer",
+        "_coverage_baseline.json")
+    _tw_keep = float(_os_twc.environ.get("TRELLIS_VIEW_REGRESS", "0.75"))
+    _tw_base = None
+    if _tw_on and _os_twc.environ.get("TRELLIS_COVERAGE_RESET", "0").strip() != "1":
+        try:
+            with open(_tw_path, "r", encoding="utf-8") as _f:
+                _tw_base = _json_twc.load(_f)
+        except Exception:
+            _tw_base = None
+    _tw_views = {}        # this run's per-view COVERED%, keyed az/el
+    _dropped_views = []    # views excluded because they collapsed (degrade, never abort)
+    _own_w = None          # best per-texel weight so far (view-ownership map)
+    _own_i = None          # which view held it
+    _front_vis = None      # the reference view's accepted mask
+    _front_dot = None      # the reference view's per-texel facing
+    _depth_eps_rel = None  # depth tolerance as a FRACTION of a view's own depth range
+    _sil_by_view = {}     # per-view silhouette warp (side/back views)
+    _fw_warned = False    # one-shot notice if the face warp cannot be bounded
+    _ref_lum  = None      # reference view's per-texel luma
+    _ref_geom = None      # reference view's per-texel geometric acceptance
+
+    # Visit views NEAREST-FIRST (angular distance from the exposure reference), so every view
+    # is exposure-matched against surface that has already been corrected. The back view shares
+    # literally zero texels with the front -- opposite sides of a body have no common surface --
+    # so in workflow order it could never be matched to anything and was left uncorrected while
+    # its neighbours were rescaled. Front -> top -> left/right -> back gives the back view the
+    # already-corrected sides to match against.
+    # _view_i stays the TRUE index, so everything keyed on it (_front_view_idx, _g_off_by_view,
+    # _anchor_by_view, face-front weighting) is unaffected, and the accumulation itself is a
+    # weighted sum, which is order-independent.
+    _order = sorted(range(len(images)),
+                    key=lambda _i: abs(((float(azimuths[_i]) + 180.0) % 360.0) - 180.0)
+                                   + abs(float(elevations[_i])))
+    if not _skip_projection:
+        print(f"[Exposure] view order (nearest-first): {_order}")
+    for _view_i in ([] if _skip_projection else _order):
+        img, az, el, view_w = (images[_view_i], azimuths[_view_i],
+                               elevations[_view_i], view_weights[_view_i])
         img_np = np.array(img.convert('RGB')).astype(np.float32) / 255.0
         img_h, img_w = img_np.shape[:2]
+
+        # --- Dilate foreground colors into background to prevent bilinear bleed ---
+        img_rgba = img.convert('RGBA')
+        img_np_rgba = np.array(img_rgba)
 
         # --- Dilate foreground colors into background to prevent bilinear bleed ---
         img_rgba = img.convert('RGBA')
@@ -506,6 +905,30 @@ def texture_mesh_with_multiview(
         else:
             fg_mask = (img_np_rgba[:, :, 3] > 127).astype(np.uint8)
 
+        # ── TRIPWIRE: a matte that covers (almost) the whole frame is not a matte ──
+        # An un-matted photo (grey studio backdrop, vignetted corners) makes the
+        # corner-pixel background test flag EVERY pixel as foreground.  Two things then
+        # break silently and the bake still "succeeds":
+        #   1. img_char_h / img_char_cy below become the whole frame instead of the
+        #      character, so pix_per_clip is wrong -> this view is projected at the
+        #      wrong scale and offset (face does not land on the face).
+        #   2. sampled_fg is true everywhere, disabling the background gate, so the
+        #      backdrop and floor get painted onto the mesh as grey blobs.
+        # Route the image through RMBG (background -> Color #000000) like the other views.
+        _fg_frac = float(fg_mask.mean())
+        if _fg_frac > 0.95:
+            print("=" * 78)
+            print(f"[MultiView] !! NO BACKGROUND MATTE on view az={az:.0f} "
+                  f"— foreground = {100.0 * _fg_frac:.1f}% of the frame")
+            print(f"[MultiView] !! corner bg={img_np_rgba[0, 0, :3].tolist()}; alignment scale AND the "
+                  f"background gate are both meaningless for this view.")
+            print(f"[MultiView] !! The backdrop WILL be baked onto the mesh. Feed this "
+                  f"image through RMBG (background=Color #000000) first.")
+            print("=" * 78)
+        elif _fg_frac < 0.005:
+            print(f"[MultiView] !! view az={az:.0f}: foreground is only "
+                  f"{100.0 * _fg_frac:.2f}% of the frame — matte looks empty.")
+
         # Dilate the foreground mask and inpaint the background band
         # Scale dilation with image resolution to prevent bilinear bleed
         base_res = 1024
@@ -515,6 +938,57 @@ def texture_mesh_with_multiview(
         dilated_fg = cv2.dilate(fg_mask, kernel, iterations=dilate_px)
         band_to_fill = cv2.bitwise_and(dilated_fg, cv2.bitwise_not(fg_mask))
 
+        # ACCEPTANCE mask: ERODE, don't dilate.
+        # The RMBG matte fades into the black background over a few pixels, and that halo is
+        # INSIDE fg_mask -- `color_diff > 10` against a black corner counts every non-black
+        # pixel as foreground -- so the anti-bleed inpaint above (which only fills OUTSIDE fg)
+        # never touches it, and the absolute `bright_enough > 0.08` test lets it through.
+        # Measured on QWEN_BACK: core brightness median 0.528, but 48.6% of the 6px rim sits
+        # between 0.08 and 0.5, with the dark band reaching 7px inside (p90). Projected, that
+        # rim is the black line along every arm / leg / torso silhouette.
+        # Eroding the acceptance mask by the same margin drops the rim; those texels are then
+        # filled from a good neighbour by the fill passes instead of from the halo.
+        # Drop only the rim pixels that are ACTUALLY dark, not the whole rim: a flat erosion
+        # also discards good silhouette skin, and on a side view (profile ~190px wide) that
+        # is a large fraction of the subject -- which then has to be invented by the fills.
+        # Dark is judged RELATIVE to this view's own foreground core, so it adapts to the
+        # character's tone instead of a fixed threshold, and interior dark content (hair,
+        # shadow) is untouched because only the rim band is considered at all.
+        erode_px  = int(max(3, 7 * scale))
+        _core     = cv2.erode(fg_mask, kernel, iterations=erode_px)
+        _rim      = cv2.bitwise_and(fg_mask, cv2.bitwise_not(_core)).astype(bool)
+        _lum      = img_np.mean(axis=2)
+        _core_med = float(np.median(_lum[_core.astype(bool)])) if _core.any() else 0.0
+        _halo     = _rim & (_lum < 0.60 * _core_med)
+        # REPAIR the halo instead of DROPPING it.
+        # Dropping assumed "the fill passes will recover these from a good neighbour" -- but the
+        # fill is off (TRELLIS_FILL=none), so every dropped rim pixel becomes permanent magenta.
+        # On a ~100px-wide leg a 6-7px rim on both contours is >10% of it, removed as a stripe
+        # along the edge; between the legs no other view can cover it, which is the inner-leg
+        # magenta stripe.
+        # These pixels are NOT missing data: the surface is plainly visible in the image. Only
+        # its colour is wrong, because the matte alpha-blends it toward black over the last few
+        # pixels. So undo the blend rather than discard the texel -- a per-pixel gain back toward
+        # this view's own foreground core. Hue is preserved (a scalar gain cannot shift it), the
+        # gain is relative to the view's own core so it adapts to the character, and it is capped
+        # so a near-black pixel cannot be amplified into noise.
+        # Nothing is invented here: every repaired pixel is one a camera actually saw.
+        import os as _os_hg
+        eroded_fg = fg_mask.copy()
+        if _os_hg.environ.get("TRELLIS_HALO_DROP", "0").strip() == "1":
+            eroded_fg[_halo] = 0                       # previous behaviour, kept as an escape
+            _halo_note = f"dropped {int(_halo.sum()):,} dark rim px"
+        elif bool(_halo.any()) and _core_med > 1e-6:
+            _g = np.clip(_core_med / np.maximum(_lum, 1e-4), 1.0, 4.0)[..., None]
+            img_np = np.where(_halo[..., None], np.clip(img_np * _g, 0.0, 1.0), img_np)
+            _halo_note = (f"repaired {int(_halo.sum()):,} dark rim px "
+                          f"(gain<=4x toward core {_core_med:.3f}), none dropped")
+        else:
+            _halo_note = "no dark rim found"
+        print(f"    [halo-guard az={az:.0f}] {_halo_note}; fg {100.0 * fg_mask.mean():.1f}% -> accept "
+              f"{100.0 * eroded_fg.mean():.1f}%  (rim {erode_px}px, core median {_core_med:.3f}, "
+              f"dropped {int(_halo.sum()):,} dark rim px)")
+
         # Inpaint the color channels into the dilated band
         img_rgb_u8 = (img_np * 255).clip(0, 255).astype(np.uint8)
         if int(band_to_fill.sum()) > 0:
@@ -523,6 +997,27 @@ def texture_mesh_with_multiview(
         img_np = img_rgb_u8.astype(np.float32) / 255.0
 
         img_t = torch.from_numpy(img_np).cuda().permute(2, 0, 1).unsqueeze(0).contiguous()
+
+        # Measure this view's elevation from its own silhouette rather than trusting the
+        # declared angle (see fit_view_elevation). Must happen before the camera basis is
+        # built, since every downstream step -- clip verts, alignment, view_min_dot -- uses it.
+        try:
+            _vnp = out_verts.detach().cpu().numpy()
+            _fgb = fg_mask.astype(bool)
+            az = fit_view_azimuth(_vnp, az, el, _fgb, tag=f" az={az:.0f}")
+            # Only re-measure elevation where it was DECLARED non-zero, i.e. where we are genuinely
+            # unsure (the custom/top view). front/back/left/right are eye-level by construction.
+            # Measured on the reframed bake: once the images had margins the fit finally ran on those
+            # views and returned el=29 for the BACK and el=9.5 for a side view -- both are 0. It
+            # misattributes the arm-span difference (mesh 0.834 vs image ~0.91) to elevation, because a
+            # wider silhouette looks like a tilted camera to that formula. The crop had hidden the bug
+            # by making the fit refuse.
+            if abs(float(el)) > 1e-6:
+                el = fit_view_elevation(_vnp, az, el, _fgb, tag=f" az={az:.0f}")
+            else:
+                print(f"[ElFit] az={az:.0f} declared el=0 (eye-level by construction) - not refitted")
+        except Exception as _efe:
+            print(f"[ViewFit] failed ({_efe!r}) — keeping declared az={az} el={el}")
 
         look, right, up = get_camera_vectors(az, el, device='cuda')
 
@@ -594,7 +1089,29 @@ def texture_mesh_with_multiview(
         # Single uniform scale derived from character height
         pix_per_clip = img_char_h / float(mesh_v_span)
 
-        print(f"    [align az={az:.0f}] img_centre=({img_char_cx:.1f},{img_char_cy:.1f}) "
+        # A cropped silhouette makes BOTH the scale and the centre above unreliable. Recover one
+        # uniform scale + offset for the whole view. Scaling about the fit centre is exactly
+        # ppc *= s with the centre shifted, so everything downstream stays consistent.
+        # Never the reference view: it is the colour and geometry anchor for every other
+        # view, its silhouette has real margins, and its fit demonstrably works.
+        if (_view_i != _frontmost_i
+                and _os_twc.environ.get("TRELLIS_FIT_SCALE", "0").strip() == "1"):
+            # OFF: the fit is CIRCULAR. It maximises overlap against the very silhouette whose
+            # truncation it is meant to correct, so scaling the mesh UP fills more of the
+            # cropped legs region and scores better while pushing real geometry out of frame.
+            # Measured: scale x1.200 raised the fit metric 63->79% while actual coverage fell
+            # 79.3%->61.4% (az270) and 72.6%->46.0% (az90), inbounds 100%->89%.
+            try:
+                _fs, _fdx, _fdy = fit_view_scale_offset(
+                    out_verts.detach().cpu().numpy(), az, el, fg_mask.astype(bool),
+                    tag=f" az={az:.0f}")
+                pix_per_clip *= _fs
+                img_char_cx += _fdx
+                img_char_cy += _fdy
+            except Exception as _fse:
+                print(f"[FitScale] failed ({_fse!r}) — keeping the height-based fit")
+
+        print(f"    [align az={az:.0f} el={el:.0f}] img_centre=({img_char_cx:.1f},{img_char_cy:.1f}) "
               f"char_h={img_char_h:.0f}px  pix/clip={pix_per_clip:.1f}")
 
         # v_clip positive = up in world = smaller y in image (origin top-left)
@@ -612,21 +1129,39 @@ def texture_mesh_with_multiview(
         # mesh's face+nipple anchors land on the photo's. Uniform-only: cannot distort the
         # body outline or smear/tear the atlas (a scale would, by extrapolating to the legs).
         # Computed once on the front-most view.
-        if feature_offset and (_g_offset is None) and abs(((az + 180.0) % 360.0) - 180.0) <= 45.0:
+        _g_offset = _g_off_by_view.get(_view_i)
+        if feature_offset and (_g_offset is None) and _view_i == _frontmost_i:
             try:
                 from .feature_anchor_warp import compute_region_offsets
                 _r = compute_region_offsets(out_verts, out_normals, img_np,
                                             img_char_cx, img_char_cy, pix_per_clip,
-                                            mesh_cx, mesh_cy, ortho_scale)
+                                            mesh_cx, mesh_cy, ortho_scale,
+                                            right=right.detach().cpu().numpy(),
+                                            up=up.detach().cpu().numpy())
                 _g_offset = (0.0, 0.0) if _r is None else _r
                 # NOTE: no blanket sanity guard here any more — it discarded the GOOD face offset
                 # whenever the body one was bad (face stayed shifted). compute_region_offsets now
                 # self-validates per anchor (L/R consistency + body-differential clamp to the face).
                 _g_offset_view = _view_i
+                _g_off_by_view[_view_i] = _g_offset
             except Exception as _ge:
-                print(f"[FeatureOffset] failed ({_ge!r})"); _g_offset = (0.0, 0.0)
-        if feature_offset and (_g_offset is not None) and _view_i == _g_offset_view:
-            if isinstance(_g_offset, tuple) and len(_g_offset) == 4:
+                print(f"[FeatureOffset] failed ({_ge!r})")
+                _g_offset = (0.0, 0.0); _g_off_by_view[_view_i] = _g_offset
+        if feature_offset and (_g_offset is not None):
+            if isinstance(_g_offset, tuple) and len(_g_offset) == 7:
+                # three zones: head -> face, chest -> nipples, belly/legs -> navel
+                (_fdx, _fdy), (_bdx, _bdy), (_ndx, _ndy), _ylo, _yhi, _ynav, _ynip = _g_offset
+                _ymn = out_verts[:, 1].min(); _yrng = (out_verts[:, 1].max() - _ymn).clamp(min=1e-9)
+                _hn = ((tex_pos[..., 1] - _ymn) / _yrng)
+                _w = ((_hn - _ylo) / max(_yhi - _ylo, 1e-6)).clamp(0.0, 1.0)
+                _w = _w * _w * (3.0 - 2.0 * _w)                    # neck: body -> face
+                _wb = ((_hn - _ynav) / max(_ynip - _ynav, 1e-6)).clamp(0.0, 1.0)
+                _wb = _wb * _wb * (3.0 - 2.0 * _wb)                # belly: navel -> body
+                _ox = _ndx + (_bdx - _ndx) * _wb
+                _oy = _ndy + (_bdy - _ndy) * _wb
+                x_pixel = x_pixel + _ox + (_fdx - _ox) * _w
+                y_pixel = y_pixel + _oy + (_fdy - _oy) * _w
+            elif isinstance(_g_offset, tuple) and len(_g_offset) == 4:
                 # height-blended: head→face_off, torso→body_off, smoothstep across the neck
                 (_fdx, _fdy), (_bdx, _bdy), _ylo, _yhi = _g_offset
                 _ymn = out_verts[:, 1].min(); _yrng = (out_verts[:, 1].max() - _ymn).clamp(min=1e-9)
@@ -651,6 +1186,29 @@ def texture_mesh_with_multiview(
                                  padding_mode='border', align_corners=True)[0]   # (2,H,W)
             _fw = F.grid_sample(face_mask_t, _grid, mode='bilinear',
                                 padding_mode='zeros', align_corners=True)[0, 0]   # (H,W)
+            # Bound the warp to REAL face geometry. face_mask_t is a purely IMAGE-SPACE convex
+            # hull of the landmarks, so on its own it bends any texel whose sample position lands
+            # inside that hull -- and on a closed head the temple, the ear and the hair at the
+            # BACK of the skull all project into the same image region as the face. Those texels
+            # were being dragged onto eyes/nose/mouth, which is the face appearing on the back of
+            # the hair, and the lip-shaped marks by the ear.
+            # face_front_w_t is per-texel and built from n_z x height x lateral ramps, so it is
+            # 3D-aware and front-facing only: geometry that is not on the front of the head gets
+            # weight 0 and cannot be warped regardless of where it projects.
+            # Geometric bound, ALWAYS available: a texel whose normal points away from this
+            # camera is not on the face, whatever its sample position lands on in the image.
+            # This is what stops the back of the skull and the hair behind it being dragged onto
+            # eyes/nose/mouth. Previously this depended on face_front_w_t, which only exists when
+            # the unrelated face_front_only option is enabled -- and it is off in practice, so the
+            # bound silently did nothing. Never gate a fix on a feature flag it does not own.
+            _facing = (tex_normals * (-look)).sum(-1).clamp(min=0.0)
+            _fw = _fw * _facing
+            if face_front_w_t is not None:
+                _fw = _fw * face_front_w_t          # extra 3-D bound when it is available
+            elif not _fw_warned:
+                print("[FaceWarp] face_front_only is off — using the geometric facing bound only "
+                      "(still 3-D, back-facing geometry cannot be warped)")
+                _fw_warned = True
             x_pixel = x_pixel * (1.0 - _fw) + _tgt[0] * _fw
             y_pixel = y_pixel * (1.0 - _fw) + _tgt[1] * _fw
 
@@ -659,23 +1217,269 @@ def texture_mesh_with_multiview(
         # face + nipples (corners pinned), then bend every sample coord through it so
         # those features land exactly. Corrects breasts-too-high / face-shift per
         # character with no manual numbers. Computed once on the front-most view.
+        _anchor_field = _anchor_by_view.get(_view_i)
         if feature_anchor_warp and (_anchor_field is None) and abs(((az + 180.0) % 360.0) - 180.0) <= 45.0:
             try:
                 from .feature_anchor_warp import compute_feature_anchor_warp
                 _anchor_field = compute_feature_anchor_warp(
                     out_verts, out_normals, img_np,
-                    img_char_cx, img_char_cy, pix_per_clip, mesh_cx, mesh_cy, ortho_scale)
+                    img_char_cx, img_char_cy, pix_per_clip, mesh_cx, mesh_cy, ortho_scale,
+                    region_off=_g_offset if feature_offset else None,
+                    skip_face=bool(face_warp_field is not None),
+                    arms_only=bool(_view_i != _frontmost_i),
+                    right=right.detach().cpu().numpy(),
+                    up=up.detach().cpu().numpy())
                 _anchor_view = _view_i
+                _anchor_by_view[_view_i] = _anchor_field
             except Exception as _awe:
                 print(f"[AnchorWarp] failed ({_awe!r}) — projecting without anchor warp")
                 _anchor_field = None
-        if feature_anchor_warp and (_anchor_field is not None) and _view_i == _anchor_view:
+        if feature_anchor_warp and (_anchor_field is not None):
+            # The field is a RESIDUAL DISPLACEMENT and its gaussians are centred on the MESH
+            # anchor pixels, so it must be sampled at the PRE-offset position (same coords the
+            # face warp uses) and ADDED -- sampling post-offset would mis-centre every gaussian,
+            # and replacing would throw away the region offset entirely.
             _af = _anchor_field.permute(2, 0, 1).unsqueeze(0).contiguous()
-            _gx = (x_pixel / float(img_w - 1)) * 2.0 - 1.0
-            _gy = (y_pixel / float(img_h - 1)) * 2.0 - 1.0
+            _gx = (_xpix_heur / float(img_w - 1)) * 2.0 - 1.0
+            _gy = (_ypix_heur / float(img_h - 1)) * 2.0 - 1.0
             _grid = torch.stack([_gx, _gy], dim=-1).unsqueeze(0)
-            _tw = F.grid_sample(_af, _grid, mode='bilinear', padding_mode='border', align_corners=True)[0]
-            x_pixel = _tw[0]; y_pixel = _tw[1]
+            _tw = F.grid_sample(_af, _grid, mode='bilinear', padding_mode='zeros', align_corners=True)[0]
+            x_pixel = x_pixel + _tw[0]; y_pixel = y_pixel + _tw[1]
+
+        # ── SILHOUETTE WARP (TRELLIS_SIL_WARP=0 to disable) ────────────────────────────
+        # It fixes the silhouette (mesh chest projected 21px past the image's forward edge) but
+        # it corrects toward the OUTLINE, and interior features are not on the outline: between
+        # the forward and rear edges it linearly blends the two edge corrections, which has no
+        # reason to be anatomically right and measurably moved the nipple the wrong way. Needs an
+        # interior falloff before it can be trusted on by default.
+        # The anchor warp needs detectable features and is gated to within 45 deg of front, so
+        # side views were projected with NO correction at all. See build_silhouette_warp.
+        import os as _os_sw
+        _sil_applies = abs(((float(az) + 180.0) % 360.0) - 180.0) > 45.0   # == anchor warp's complement
+        # OFF by default (TRELLIS_SIL_WARP=1 to enable). It does fix a real error -- the mesh
+        # chest projected 21px past the generated profile's forward silhouette edge -- but an
+        # A/B showed it is what smeared the hair on the back view into horizontal bands. The
+        # per-row correspondence is least trustworthy exactly where mesh and generated
+        # silhouettes disagree most, which is the hair, and there it applies its largest
+        # corrections (70px against a median of 8). Before re-enabling it needs to fade out
+        # where that disagreement is large, instead of trusting it most where it is worst.
+        # TRELLIS_SIL_WARP:  "dy" (default) = vertical shift only | "1"/"full" = also the
+        #                    per-row horizontal correction | "0" = off entirely.
+        # The two halves of this warp behave completely differently. The per-row HORIZONTAL
+        # correction fixes the chest depth error (21px -> 0.5px) but varies row to row, and that
+        # is what smeared the hair into horizontal bands -- twice, and the trust taper did not
+        # save it because the MEDIAN correction is ~20px, not just the outliers.
+        # The VERTICAL part is a single number for the whole view. A rigid translation cannot
+        # produce per-row artefacts, so it carries none of that risk, and it is worth having:
+        # measured +24 and +26px on the two side views, which is uncorrected vertical drift that
+        # puts the side image's EAR about 25px below the mesh's ear -- the ear-shaped patch
+        # appearing down in the hair. Side views get no anchor warp, so nothing else fixes it.
+        _sil_mode = _os_sw.environ.get("TRELLIS_SIL_WARP", "0").strip().lower()
+        if _sil_applies and _sil_mode != "0":
+            if _view_i not in _sil_by_view:
+                _swv = None
+                try:
+                    _cc = cam_clip[0]
+                    _vx = (img_char_cx + (_cc[:, 0] - mesh_cx) * pix_per_clip).detach().cpu().numpy()
+                    _vy = (img_char_cy - (_cc[:, 1] - mesh_cy) * pix_per_clip).detach().cpu().numpy()
+                    _swv = build_silhouette_warp(_vx, _vy, fg_mask.astype(bool))
+                except Exception as _swe:
+                    print(f"[SilWarp] az={az:.0f}: failed ({_swe!r}) — projecting uncorrected")
+                    _swv = None
+                if _swv is not None:
+                    _dy0, _mL0, _mR0, _dxL0, _dxR0, _vld0 = _swv
+                    _sel = _vld0 > 0
+                    _swv = (_dy0,
+                            torch.from_numpy(_mL0).cuda(), torch.from_numpy(_mR0).cuda(),
+                            torch.from_numpy(_dxL0).cuda(), torch.from_numpy(_dxR0).cuda(),
+                            torch.from_numpy(_vld0).cuda())
+                    print(f"[SilWarp] mode={_sil_mode} az={az:.0f} el={el:.0f}: dy={_dy0:+d}px over {int(_sel.sum())} "
+                          f"matched rows; edge correction med={float(np.median(np.abs(_dxR0[_sel]))):.1f}px "
+                          f"max={float(np.abs(_dxR0[_sel]).max()):.1f}px")
+                _sil_by_view[_view_i] = _swv
+            _swv = _sil_by_view[_view_i]
+            if _swv is not None:
+                _dy0, _tL, _tR, _tdL, _tdR, _tv = _swv
+                y_pixel = y_pixel + float(_dy0)          # rigid: cannot band
+                if _sil_mode in ("1", "full"):
+                    _ri = y_pixel.clamp(0, img_h - 1).long()
+                    _Lr = _tL[_ri]; _Rr = _tR[_ri]; _wr = _tv[_ri]
+                    _tt = ((x_pixel - _Lr) / (_Rr - _Lr).clamp(min=1.0)).clamp(0.0, 1.0)
+                    x_pixel = x_pixel + _wr * (_tdL[_ri] + (_tdR[_ri] - _tdL[_ri]) * _tt)
+
+        # ── ALIGN A SIDE VIEW AGAINST THE FRONT VIEW (photometric, report-only) ───────
+        # Silhouette overlap and on-foreground coverage BOTH have a degenerate direction:
+        # overlap is maximised by scaling UP to fill a truncated silhouette (coverage then fell
+        # 79%->61%), coverage is maximised by scaling DOWN so every sample lands inside the
+        # silhouette (that pushed the ear higher while the numbers hit record highs). Neither
+        # knows WHICH pixel a texel should receive, so neither can locate an alignment.
+        #
+        # The front view does know: it is well-aligned (anchors within ~8px) and it shares a
+        # large band of surface with each side view -- 0.8-1.2M texels, per the exposure match.
+        # So score a candidate by how well the side view's sampled colour AGREES with what the
+        # front view got for the SAME texels. Normalised cross-correlation, so the exposure
+        # difference between views cannot influence it.
+        # This cannot be gamed by scaling either way: shrink and the samples come from the wrong
+        # places, so agreement drops; grow and they leave the frame, so agreement drops. Only
+        # real alignment makes two views agree about the same surface.
+        # REPORT ONLY unless TRELLIS_ALIGN=apply -- measure first, act only on a sharp peak.
+        if (_view_i != _frontmost_i and _ref_lum is not None and _ref_geom is not None
+                and _os_sw.environ.get("TRELLIS_ALIGN", "report").strip() != "0"):
+            try:
+                _both0 = uv_hit_mask & _ref_geom & (( (tex_normals * (-look)).sum(-1) ) > 0.20)
+                _nb = int(_both0.sum().item())
+                if _nb > 20000:
+                    _ixb = torch.nonzero(_both0, as_tuple=False)
+                    if _ixb.shape[0] > 150000:
+                        _ixb = _ixb[torch.randperm(_ixb.shape[0], device=_ixb.device)[:150000]]
+                    _by, _bx = _ixb[:, 0], _ixb[:, 1]
+                    _tgt = _ref_lum[_by, _bx]
+                    _tgt = (_tgt - _tgt.mean()) / _tgt.std().clamp(min=1e-6)
+                    _xb = x_pixel[_by, _bx]; _yb = y_pixel[_by, _bx]
+                    _lum_img = torch.from_numpy(img_np.mean(axis=2).astype(np.float32)).cuda()
+                    _fgb = torch.from_numpy(eroded_fg.astype(np.bool_)).cuda()
+                    def _ncc(_sc, _dx, _dy):
+                        _X = img_char_cx + (_xb - img_char_cx) * _sc + _dx
+                        _Y = img_char_cy + (_yb - img_char_cy) * _sc + _dy
+                        _ok = (_X >= 0) & (_X < img_w) & (_Y >= 0) & (_Y < img_h)
+                        _xi = _X.clamp(0, img_w - 1).long(); _yi = _Y.clamp(0, img_h - 1).long()
+                        _ok = _ok & _fgb[_yi, _xi]
+                        if int(_ok.sum().item()) < 5000:
+                            return -1.0
+                        _v = _lum_img[_yi[_ok], _xi[_ok]]
+                        _v = (_v - _v.mean()) / _v.std().clamp(min=1e-6)
+                        return float((_v * _tgt[_ok]).mean().item())
+                    _id0 = _ncc(1.0, 0.0, 0.0)
+                    _bb = (_id0, 1.0, 0.0, 0.0)
+                    for _sc in (0.92, 0.96, 1.00, 1.04, 1.08, 1.12):
+                        for _dx in (-24, -12, 0, 12, 24):
+                            for _dy in (-40, -20, -10, 0, 10, 20, 40):
+                                _v2 = _ncc(_sc, _dx, _dy)
+                                if _v2 > _bb[0]:
+                                    _bb = (_v2, _sc, float(_dx), float(_dy))
+                    _peak = _bb[0] - _id0
+                    print(f"    [Align az={az:.0f} el={el:.0f}] NCC vs front on {_nb:,} shared "
+                          f"texels: identity {_id0:+.3f} -> best {_bb[0]:+.3f} "
+                          f"(scale x{_bb[1]:.2f} dx={_bb[2]:+.0f} dy={_bb[3]:+.0f}, gain {_peak:+.3f})")
+                    if _os_sw.environ.get("TRELLIS_ALIGN", "report").strip() == "apply" and _peak > 0.02:
+                        x_pixel = img_char_cx + (x_pixel - img_char_cx) * _bb[1] + _bb[2]
+                        y_pixel = img_char_cy + (y_pixel - img_char_cy) * _bb[1] + _bb[3]
+                        print(f"    [Align az={az:.0f}] applied")
+                else:
+                    print(f"    [Align az={az:.0f}] only {_nb:,} texels shared with the front view "
+                          f"-- too few to align on")
+            except Exception as _ale:
+                print(f"    [Align az={az:.0f}] skipped: {_ale!r}")
+
+        # ── DEPTH SCALE for profile views (horizontal only) ───────────────────────────
+        # In a profile the image's HORIZONTAL axis is the body's front-back axis. The generated
+        # character is shallower front-to-back than the mesh -- measured: the mesh's chest projects
+        # 21px PAST the image's forward silhouette edge at upper chest, 9px at the nipple line.
+        # So mesh front texels sample from too far back and rear texels from too far forward: the
+        # content lands compressed toward the middle. Every earlier fit used a UNIFORM scale and
+        # so could not express "wrong in depth, right in height", which is why they all failed.
+        # Measured, not optimised: the ratio of the image's body width to the mesh's projected
+        # body width over the TORSO rows only (hair dominates the head band and mesh hair differs
+        # from generated hair). Vertical untouched, no per-row term, so it cannot band.
+        if (abs(math.sin(math.radians(float(az))) * math.cos(math.radians(float(el)))) > 0.7
+                and _os_sw.environ.get("TRELLIS_DEPTH_SCALE", "1").strip() != "0"):
+            try:
+                _ymnD = out_verts[:, 1].min(); _yrgD = (out_verts[:, 1].max() - _ymnD).clamp(min=1e-9)
+                _hnD = ((tex_pos[..., 1] - _ymnD) / _yrgD)
+                _bandD = uv_hit_mask & (_hnD > 0.42) & (_hnD < 0.72)
+                if int(_bandD.sum().item()) > 20000:
+                    _bxD = x_pixel[_bandD]; _byD = y_pixel[_bandD]
+                    _mlo = float(torch.quantile(_bxD, 0.005).item())
+                    _mhi = float(torch.quantile(_bxD, 0.995).item())
+                    _r0D = int(max(0, min(img_h - 1, torch.quantile(_byD, 0.05).item())))
+                    _r1D = int(max(0, min(img_h - 1, torch.quantile(_byD, 0.95).item())))
+                    _colsD = np.where(eroded_fg[_r0D:_r1D + 1].any(axis=0))[0]
+                    if len(_colsD) > 10 and (_mhi - _mlo) > 1.0:
+                        _ilo = float(_colsD.min()); _ihi = float(_colsD.max())
+                        _sx = (_ihi - _ilo) / (_mhi - _mlo)
+                        _mcD = 0.5 * (_mlo + _mhi); _icD = 0.5 * (_ilo + _ihi)
+                        if 0.5 < _sx < 2.0:
+                            x_pixel = _icD + (x_pixel - _mcD) * _sx
+                            print(f"    [DepthScale az={az:.0f}] torso width mesh {_mhi-_mlo:.0f}px "
+                                  f"vs image {_ihi-_ilo:.0f}px -> x-scale {_sx:.3f}, centre "
+                                  f"{_mcD:.0f}->{_icD:.0f} (vertical untouched)")
+                        else:
+                            print(f"    [DepthScale az={az:.0f}] implausible ratio {_sx:.2f} -- skipped")
+            except Exception as _dse:
+                print(f"    [DepthScale az={az:.0f}] skipped: {_dse!r}")
+
+        # ── EAR MATCH for profile views ───────────────────────────────────────────────
+        # The depth scale is measured on the TORSO, because at head height the silhouette is hair,
+        # and mesh-hair vs generated-hair is the mismatch that dragged every earlier fit. The head
+        # therefore needs its own correspondence, and a real one exists: the ear is the
+        # skin-coloured region inside the head. The mesh knows where its ear is (the head's lateral
+        # extreme); in the image it is a skin-coloured blob surrounded by hair. Matching the two
+        # centroids gives the head's correction directly -- a feature match, not a silhouette
+        # statistic. Applied to the head only and faded out by height, so the torso (already
+        # handled by the depth scale) is untouched. TRELLIS_EAR_MATCH=0 disables.
+        if (abs(math.sin(math.radians(float(az))) * math.cos(math.radians(float(el)))) > 0.7
+                and _os_sw.environ.get("TRELLIS_EAR_MATCH", "1").strip() != "0"):
+            try:
+                from scipy import ndimage as _ndi
+                _ymnE = out_verts[:, 1].min(); _yrgE = (out_verts[:, 1].max() - _ymnE).clamp(min=1e-9)
+                _hnE = ((tex_pos[..., 1] - _ymnE) / _yrgE)
+                _headE = uv_hit_mask & (_hnE > 0.82)
+                _absxE = tex_pos[..., 0].abs()
+                if int(_headE.sum().item()) > 5000:
+                    _hwE = float(_absxE[_headE].median().item())
+                    _facE = (tex_normals * (-look)).sum(-1)
+                    _earE = _headE & (_absxE > 1.6 * max(_hwE, 1e-6)) & (_facE > 0.25)
+                    if int(_earE.sum().item()) > 200:
+                        _emx = float(x_pixel[_earE].median().item())
+                        _emy = float(y_pixel[_earE].median().item())
+                        _hyE = y_pixel[_headE]
+                        _r0E = int(max(0, torch.quantile(_hyE, 0.02).item()))
+                        _r1E = int(min(img_h - 1, torch.quantile(_hyE, 0.98).item()))
+                        _subE = img_np[_r0E:_r1E + 1]
+                        _mE = eroded_fg[_r0E:_r1E + 1].astype(bool)
+                        if int(_mE.sum()) > 500:
+                            _chE = _subE / np.maximum(_subE.sum(axis=2, keepdims=True), 1e-6)
+                            _medE = np.median(_chE[_mE], axis=0)      # head band is mostly hair
+                            _dE = np.linalg.norm(_chE - _medE[None, None, :], axis=2)
+                            _skinE = _mE & (_dE > float(np.quantile(_dE[_mE], 0.90)))
+                            _lab, _nlab = _ndi.label(_skinE)
+                            if _nlab >= 2:
+                                _sz = np.asarray(_ndi.sum(_skinE, _lab, range(1, _nlab + 1)), dtype=float)
+                                # Pick the ear by POSITION, not size. The face is always the FRONTMOST skin region in a
+                                # profile and the ear sits behind it; picking 'second largest' grabbed another piece of
+                                # the face whenever it split into two regions, which dragged the ear forward onto the
+                                # cheek. 'Forward' is known from the camera basis: right[2] > 0 means the character's
+                                # front (+Z) maps to increasing image x.
+                                _fwd_pos = bool(float(right[2].item()) > 0)
+                                _cents = _ndi.center_of_mass(_skinE, _lab, range(1, _nlab + 1))
+                                _cxs = [float(c[1]) for c in _cents]
+                                _face_i = int(np.argmax(_cxs) if _fwd_pos else np.argmin(_cxs))
+                                _cand = [q for q in range(_nlab) if q != _face_i and _sz[q] > 0.02 * float(_sz.max())]
+                                if not _cand:
+                                    raise ValueError('no skin region behind the face to use as the ear')
+                                _pick = int(max(_cand, key=lambda q: _sz[q])) + 1
+                                _cyE, _cxE = _ndi.center_of_mass(_skinE, _lab, _pick)
+                                _icx2 = float(_cxE); _icy2 = float(_cyE) + _r0E
+                                _dxE = _icx2 - _emx; _dyE = _icy2 - _emy
+                                if abs(_dxE) < 0.25 * img_w and abs(_dyE) < 0.25 * img_h:
+                                    _wE = ((_hnE - 0.62) / 0.20).clamp(0.0, 1.0)
+                                    _wE = _wE * _wE * (3.0 - 2.0 * _wE)
+                                    x_pixel = x_pixel + _wE * _dxE
+                                    y_pixel = y_pixel + _wE * _dyE
+                                    print(f"    [EarMatch az={az:.0f}] mesh ear ({_emx:.0f},{_emy:.0f})"
+                                          f" -> image ear ({_icx2:.0f},{_icy2:.0f})  shift "
+                                          f"({_dxE:+.0f},{_dyE:+.0f}) on the head band "
+                                          f"(blob {int(_sz[_pick - 1]):,}px of {_nlab} skin regions)")
+                                else:
+                                    print(f"    [EarMatch az={az:.0f}] implausible shift "
+                                          f"({_dxE:+.0f},{_dyE:+.0f}) -- not applied")
+                            else:
+                                print(f"    [EarMatch az={az:.0f}] {_nlab} skin region(s) -- cannot "
+                                      f"separate ear from face")
+                    else:
+                        print(f"    [EarMatch az={az:.0f}] too few mesh ear texels face this view")
+            except Exception as _eme:
+                print(f"    [EarMatch az={az:.0f}] skipped: {_eme!r}")
 
         u_samp_raw = ((x_pixel + 0.5) / float(img_w)) * 2.0 - 1.0
         v_samp_raw = ((y_pixel + 0.5) / float(img_h)) * 2.0 - 1.0
@@ -713,12 +1517,30 @@ def texture_mesh_with_multiview(
 
         tex_depth = -(tex_pos * look).sum(-1)
 
-        depth_match = tex_depth >= sampled_depth - depth_eps
+        # RELATIVE depth tolerance. `depth_eps` is an absolute world-space number, but the depth
+        # range being compared differs per view: for the front view the axis is the body's Z
+        # extent (~0.21), for a profile it is the whole arm span (~0.87). The same 0.002 is
+        # therefore ~0.95% of the range on the front view and ~0.23% on a side view -- four times
+        # stricter, on exactly the views that then reported depth=62-75% while the front reported
+        # 99%. Measured consequence: 93.4% of the magenta on the finished model faces a camera
+        # above its angle gate, i.e. it should have been painted and was false-rejected here.
+        # The fraction is not a new constant: it is taken from the FRONT view's existing
+        # behaviour, so that view is bit-identical and every other view simply gets the same
+        # relative tolerance instead of an accidentally harsher one.
+        _dvalid = tex_depth[uv_hit_mask] if bool(uv_hit_mask.any()) else tex_depth
+        _dspan = float((_dvalid.max() - _dvalid.min()).item()) if _dvalid.numel() else 0.0
+        if _depth_eps_rel is None or _view_i == _frontmost_i:
+            _eps_here = float(depth_eps)
+            if _dspan > 1e-9:
+                _depth_eps_rel = float(depth_eps) / _dspan
+        else:
+            _eps_here = _depth_eps_rel * _dspan if _dspan > 1e-9 else float(depth_eps)
+        depth_match = tex_depth >= sampled_depth - _eps_here
 
         # Foreground check: reject texels that project onto the image background.
         # Use the DILATED foreground mask (not the raw one) so that soft edges
         # in SV3D-generated frames don't create dark halos at island boundaries.
-        fg_mask_t    = torch.from_numpy(dilated_fg.astype(np.float32)).cuda().unsqueeze(0).unsqueeze(0)
+        fg_mask_t    = torch.from_numpy(eroded_fg.astype(np.float32)).cuda().unsqueeze(0).unsqueeze(0)
         grid_fg      = torch.stack([u_samp, v_samp], dim=-1).unsqueeze(0)
         sampled_fg   = F.grid_sample(
             fg_mask_t, grid_fg, mode='bilinear', padding_mode='zeros', align_corners=False
@@ -760,10 +1582,172 @@ def texture_mesh_with_multiview(
         # breast tips and gets flagged "self-occluded". Skip depth for texels that
         # clearly face this camera (they can't be a hidden/back surface); keep it for
         # grazing/side texels. Fixes the missing chest with no back-leak.
-        depth_ok = depth_match | (dot_raw > front_skip_depth_dot)
+        # Gated to the FRONT view. The skip exists because a flat front photo shows every
+        # front-facing texel, so a self-occlusion test there only produces false rejects. On
+        # ANY OTHER view it switches occlusion off precisely where a surface faces that camera
+        # hard -- the torso flank or the side of the skull on a profile, the scalp from above --
+        # so hair draped in front of that surface gets sampled straight onto the body. That was
+        # the smeared hair-coloured block on the flanks, and it is why the profile views report
+        # depth=95%/83% while the back view (whose surfaces face it squarely, unoccluded) is 99%.
+        if _view_i == _frontmost_i:
+            depth_ok = depth_match | (dot_raw > front_skip_depth_dot)
+        else:
+            depth_ok = depth_match
+
+        # ── NEAR-ARM OCCLUDER (profile views only) ────────────────────────────────────
+        # In a T-pose profile the near arm points straight AT the camera, so it appears as a
+        # foreshortened fist sitting over the hair and shoulder. The depth test does not remove
+        # what it hides, because the mesh's arm and the generated image's hand do not occupy the
+        # same pixels -- the arms are the worst-aligned part of the mesh (21-61px on the front
+        # view) -- so the mesh shadows one region while the image's hand covers another, and every
+        # texel in the gap samples HAND. That is the "ear pointing down" in the hair, on both
+        # sides, and no amount of vertical or silhouette correction touches it.
+        # A profile view's own near arm is therefore unusable for anything except the arm itself.
+        # Reject any texel that samples inside the projected near-arm footprint while not being
+        # on that arm. Purely geometric: the arm is identified by the torso's own half-width,
+        # measured at hip height where a T-pose arm cannot reach, so there is no tuned distance.
+        _nearm_rej = None
+        # OFF. It rejects using the MESH's arm footprint, but the image's hand sits at a
+        # different height -- confirmed on the bake: the hand painted on the hair is ABOVE
+        # the real hand. So it removed coverage where the mesh's arm is while the image's
+        # hand kept bleeding: new magenta, artefact untouched. Enable with TRELLIS_NEARARM=1.
+        _camx = abs(math.sin(math.radians(float(az))) * math.cos(math.radians(float(el))))
+        if _camx > 0.7 and _os_sw.environ.get('TRELLIS_NEARARM', '0').strip() == '1':
+            try:
+                _v3 = out_verts.detach().cpu().numpy()
+                _hnv = ((_v3[:, 1] - _v3[:, 1].min())
+                        / max(float(_v3[:, 1].max() - _v3[:, 1].min()), 1e-9))
+                _hipb = (_hnv > 0.33) & (_hnv < 0.48)
+                _halfw = (float(np.percentile(np.abs(_v3[_hipb, 0]), 98)) if int(_hipb.sum()) > 50
+                          else float(np.abs(_v3[:, 0]).max()))
+                _sgn = 1.0 if math.sin(math.radians(float(az))) > 0 else -1.0
+                _armv = (_v3[:, 0] * _sgn) > _halfw
+                if int(_armv.sum()) > 50:
+                    _cc = cam_clip[0]
+                    _apx = (img_char_cx + (_cc[:, 0] - mesh_cx) * pix_per_clip).detach().cpu().numpy()
+                    _apy = (img_char_cy - (_cc[:, 1] - mesh_cy) * pix_per_clip).detach().cpu().numpy()
+                    _mk = np.zeros((img_h, img_w), np.uint8)
+                    _mk[np.clip(np.rint(_apy[_armv]).astype(int), 0, img_h - 1),
+                        np.clip(np.rint(_apx[_armv]).astype(int), 0, img_w - 1)] = 1
+                    _mk = cv2.dilate(_mk, np.ones((3, 3), np.uint8), iterations=3)
+                    _mt = torch.from_numpy(_mk.astype(bool)).cuda()
+                    _px = x_pixel.round().long().clamp(0, img_w - 1)
+                    _py = y_pixel.round().long().clamp(0, img_h - 1)
+                    _is_arm = (tex_pos[..., 0] * _sgn) > _halfw
+                    _nearm_rej = _mt[_py, _px] & (~_is_arm)
+                    print(f"    [NearArm az={az:.0f}] footprint {int(_mk.sum()):,}px "
+                          f"(|x|>{_halfw:.3f}); rejecting {int(_nearm_rej.sum()):,} non-arm texels "
+                          f"sampling through it")
+            except Exception as _nae:
+                print(f"    [NearArm az={az:.0f}] skipped: {_nae!r}")
+
+        # Geometric acceptance -- everything except the brightness test, which depends on the
+        # colours we are about to correct (using `visible` here would be circular).
+        _geom_ok = uv_hit_mask & in_bounds & sampled_hit & depth_ok & sampled_fg & good_angle
+        if _nearm_rej is not None:
+            _geom_ok = _geom_ok & (~_nearm_rej)
+
+        if _ref_lum is None:
+            # first view visited is the reference; it defines the exposure everything matches
+            _ref_lum  = sampled_colors.mean(dim=-1).clone()
+            _ref_geom = _geom_ok.clone()
+            print(f"[Exposure] view {_view_i} az={az:.0f} el={el:.0f} = REFERENCE "
+                  f"({int(_ref_geom.sum().item())} texels)")
+        else:
+            _both = _geom_ok & _ref_geom
+            _nsh  = int(_both.sum().item())
+            if _nsh >= 500:
+                _gm = float(torch.median(_ref_lum[_both])
+                            / torch.clamp(torch.median(sampled_colors.mean(dim=-1)[_both]), min=1e-6))
+                sampled_colors = torch.clamp(sampled_colors * _gm, 0.0, 1.0)
+                print(f"[Exposure] view {_view_i} az={az:.0f} el={el:.0f} "
+                      f"gain={_gm:.3f}  (measured on {_nsh} shared texels)")
+            else:
+                print(f"[Exposure] view {_view_i} az={az:.0f} el={el:.0f} "
+                      f"— only {_nsh} shared texels, left as generated")
+            # Grow the reference with this view's now-corrected colour, on surface no earlier
+            # view reached. This is what lets the back view match: by the time it is visited,
+            # the sides have contributed the flanks it actually shares.
+            _fresh = _geom_ok & (~_ref_geom)
+            if bool(_fresh.any()):
+                _ref_lum  = torch.where(_fresh, sampled_colors.mean(dim=-1), _ref_lum)
+                _ref_geom = _ref_geom | _geom_ok
+
+        # brightness must be re-derived from the CORRECTED colours
+        brightness    = sampled_colors.mean(dim=-1)
+        bright_enough = brightness > 0.08
 
         # Visibility Mask
-        visible = uv_hit_mask & in_bounds & sampled_hit & depth_ok & sampled_fg & bright_enough & good_angle
+        visible = _geom_ok & bright_enough
+
+        # ── REJECTION DUMP (TRELLIS_DUMP_REJECT=1) ────────────────────────────────────
+        # Writes, per view, the exact image the projector sampled plus a map of WHERE each
+        # rejected texel sampled, colour-coded by the term that rejected it. Reconstructing the
+        # matte offline gave answers that disagreed with the bake's own fg% by 4x, so this reads
+        # the real arrays instead of approximating them.
+        #   white = accepted   red = fg (sampled background)   blue = depth   green = angle
+        #   yellow = bright    magenta = out of bounds / no raster hit
+        # default "1": ON for one diagnostic run; set back to "0" afterwards.
+        if _os_sw.environ.get("TRELLIS_DUMP_REJECT", "0").strip() == "1":
+            try:
+                import os as _od
+                from PIL import Image as _PI
+                _dd = _os_sw.path.join(_os_sw.path.dirname(_os_sw.path.dirname(
+                    _os_sw.path.dirname(_os_sw.path.dirname(_os_sw.path.abspath(__file__))))),
+                    "uv_transfer")
+                _tag = f"az{az:.0f}_el{el:.0f}"
+                _PI.fromarray((np.clip(img_np, 0, 1) * 255).astype(np.uint8)).save(
+                    _od.path.join(_dd, f"_rej_{_tag}_image.png"))
+                _PI.fromarray((eroded_fg.astype(np.uint8) * 255)).save(
+                    _od.path.join(_dd, f"_rej_{_tag}_matte.png"))
+                _canvas = np.zeros((img_h, img_w, 3), np.uint8)
+                _xi = x_pixel.round().long().clamp(0, img_w - 1)
+                _yi = y_pixel.round().long().clamp(0, img_h - 1)
+                _sel = uv_hit_mask & (dot_raw > 0.12)
+                for _m, _col in ((visible, (255, 255, 255)),
+                                 (_sel & ~good_angle, (0, 255, 0)),
+                                 (_sel & good_angle & ~depth_ok, (0, 0, 255)),
+                                 (_sel & good_angle & depth_ok & ~sampled_fg, (255, 0, 0)),
+                                 (_sel & good_angle & depth_ok & sampled_fg & ~bright_enough,
+                                  (255, 255, 0)),
+                                 (_sel & ~(in_bounds & sampled_hit), (255, 0, 255))):
+                    _mm = (_sel & _m)
+                    if not bool(_mm.any()):
+                        continue
+                    _yy = _yi[_mm].cpu().numpy(); _xx = _xi[_mm].cpu().numpy()
+                    _canvas[_yy, _xx] = _col
+                _PI.fromarray(_canvas).save(_od.path.join(_dd, f"_rej_{_tag}_map.png"))
+                print(f"    [RejectDump] {_tag}: wrote _rej_{_tag}_image/matte/map.png")
+
+                # WHERE DOES EACH TEXEL ACTUALLY SAMPLE? Plot every accepted texel's sample
+                # position on the very image the projector read, tinted by its HEIGHT on the
+                # mesh (blue = feet -> red = top of head), over a dimmed copy of that image.
+                # If the mapping is vertically correct the red band sits on the head in the
+                # photo; if it is shifted the bands sit off the body by exactly that amount.
+                # Ear texels are drawn bright green: the head's laterally-extreme geometry,
+                # found relative to the head's own width so it needs no per-character number.
+                _ymn = tex_pos[..., 1].min(); _yrg = (tex_pos[..., 1].max() - _ymn).clamp(min=1e-9)
+                _hn = ((tex_pos[..., 1] - _ymn) / _yrg)
+                _ov = (np.clip(img_np, 0, 1) * 0.40 * 255).astype(np.uint8)
+                _m = uv_hit_mask & visible
+                if bool(_m.any()):
+                    _h = _hn[_m].cpu().numpy()
+                    _yy = _yi[_m].cpu().numpy(); _xx = _xi[_m].cpu().numpy()
+                    _ov[_yy, _xx, 0] = (255 * np.clip(_h, 0, 1)).astype(np.uint8)
+                    _ov[_yy, _xx, 2] = (255 * np.clip(1.0 - _h, 0, 1)).astype(np.uint8)
+                _headband = uv_hit_mask & (_hn > 0.88)
+                if bool(_headband.any()):
+                    _absx = tex_pos[..., 0].abs()
+                    _hw = float(_absx[_headband].median().item())
+                    _ear = _headband & (_absx > 1.6 * max(_hw, 1e-6))
+                    if bool(_ear.any()):
+                        _yy = _yi[_ear].cpu().numpy(); _xx = _xi[_ear].cpu().numpy()
+                        _ov[_yy, _xx] = (0, 255, 0)
+                        print(f"    [RejectDump] {_tag}: {int(_ear.sum()):,} ear texels marked "
+                              f"green (head median |x|={_hw:.3f})")
+                _PI.fromarray(_ov).save(_od.path.join(_dd, f"_rej_{_tag}_where.png"))
+            except Exception as _rde:
+                print(f"    [RejectDump] failed: {_rde!r}")
 
         # KAN-9 — per-mask coverage diagnostic on the REAL bake mesh (the offline
         # reproduction kept disagreeing with the bake; this prints the ground truth).
@@ -772,16 +1756,69 @@ def texture_mesh_with_multiview(
             _n  = int(_ff.sum().item())
             if _n > 0:
                 _p = lambda m: 100.0 * int((_ff & m).sum().item()) / _n
-                print(f"[CoverageDiag az={az:.0f}] front-facing={_n}  "
+                _tw_views["az{:.0f}_el{:.0f}".format(az, el)] = _p(visible)
+                print(f"[CoverageDiag az={az:.0f} el={el:.0f}] front-facing={_n}  "
                       f"inbounds={_p(in_bounds):.0f}% occ={_p(sampled_hit):.0f}% "
                       f"depth={_p(depth_ok):.0f}% fg={_p(sampled_fg):.0f}% "
-                      f"bright={_p(bright_enough):.0f}% angle={_p(good_angle):.0f}%  "
+                      f"bright={_p(bright_enough):.0f}% angle={_p(good_angle):.0f}% "
+                      f"eps={_eps_here:.4f}  "
                       f"=> COVERED={_p(visible):.0f}%")
         except Exception as _cde:
             print(f"[CoverageDiag] skipped: {_cde!r}")
 
+        # -- PER-VIEW TRIPWIRE: reject a bad bake here, at the earliest point it is detectable,
+        # rather than letting four more views, the seam-hair pass, the atlas pass, the FBX export
+        # and the rigging run first. Relative to what this view has achieved before.
+        # PER-VIEW TRIPWIRE: DROP the view, never abort the bake.
+        # Aborting here turns a one-view problem into a total loss after ~20 minutes of Qwen and
+        # Trellis work that cannot be cached for a new character. A collapsed view is excluded
+        # from the blend and the other views carry on, so the run still produces an asset with a
+        # known, reported gap. Only a total collapse (every view gone) is fatal, because then
+        # there is nothing to paint with.
+        _drop_this_view = False
+        if _tw_on and _tw_base:
+            _vk = "az{:.0f}_el{:.0f}".format(az, el)
+            _prev = (_tw_base.get("views") or {}).get(_vk)
+            _cur = _tw_views.get(_vk)
+            if isinstance(_prev, (int, float)) and _prev > 0 and _cur is not None:
+                _floor = float(_prev) * _tw_keep
+                print("[Tripwire] view {} covered {:.1f}%  (best {:.1f}%, floor {:.1f}%)".format(
+                    _vk, _cur, float(_prev), _floor))
+                if _cur < _floor:
+                    _drop_this_view = True
+                    _dropped_views.append((_vk, _cur, float(_prev)))
+                    print("[Tripwire] !! view {} COLLAPSED ({:.1f}% vs floor {:.1f}%) even after "
+                          "repair -- DROPPING it and continuing. The bake completes; the surface "
+                          "it covered stays unpainted.".format(_vk, _cur, _floor))
+
         dot = dot_raw.clamp(min=0.0) ** 1.5
         weights = (dot ** blend_exponent) * visible.float() * view_w
+        if _drop_this_view:
+            weights = torch.zeros_like(weights)
+
+        # ── THE BEST-PLACED VIEW OWNS THE SURFACE ─────────────────────────────────────
+        # A nipple faces the front camera almost head-on and is nearly edge-on to a side camera,
+        # so the side view has no business colouring it -- but it still contributed, and because
+        # the generated profile is shallower than the mesh, what it contributed was the shaded
+        # breast rim landing at the wrong depth: the second, misplaced nipple.
+        # Fade a non-reference view in proportion to how much better the reference view faces the
+        # same surface. Purely geometric -- no regions, no thresholds, and it applies to the whole
+        # body rather than a hand-drawn chest area.
+        # CRITICAL: gated on the reference view having actually PAINTED that texel. Where the
+        # front view missed, nothing is faded, so this cannot open a new hole -- which is the
+        # whole point, given everything visible has to stay painted.
+        if _view_i == _frontmost_i:
+            _front_vis = visible.clone()
+            _front_dot = dot_raw.clone()
+        elif (_front_vis is not None) and (_front_dot is not None):
+            # Cubic, not linear. Linear left the side view at 25% weight on a nipple (front dot
+            # ~0.95 vs side ~0.20), and 25% of a wrongly-placed nipple is still a visible nipple.
+            # Cubed that becomes ~1.6%, while surfaces both views see comparably (adv ~ 0) are
+            # untouched -- so it is a sharp handoff exactly where one view is clearly better
+            # placed, and no change at all anywhere else.
+            _adv = (_front_dot - dot_raw).clamp(0.0, 1.0)     # how much better the front sees it
+            _keep = (1.0 - _adv) ** 3
+            weights = weights * torch.where(_front_vis, _keep, torch.ones_like(_keep))
 
         # KAN-9 — in the face region, keep ONLY the front view: every other view's
         # weight is faded out by (1 - face_weight) so it cannot contribute colour
@@ -789,12 +1826,50 @@ def texture_mesh_with_multiview(
         if face_front_w_t is not None and _view_i != _front_view_idx:
             weights = weights * (1.0 - face_front_w_t)
 
+        # VIEW-OWNERSHIP MAP: remember which view contributed most to each texel, so an artefact
+        # can be traced to the view that painted it instead of guessed at.
+        if _own_w is None:
+            _own_w = torch.zeros_like(weights)
+            _own_i = torch.full(weights.shape, -1, dtype=torch.int16, device=weights.device)
+        _better = weights > _own_w
+        _own_w = torch.where(_better, weights, _own_w)
+        _own_i = torch.where(_better, torch.full_like(_own_i, int(_view_i)), _own_i)
+
         acc_color += sampled_colors * weights.unsqueeze(-1)
         acc_weight += weights
 
     # =========================================================================
     # STEP 4 – Normalize and blend over existing PBR texture
     # =========================================================================
+    if _dropped_views:
+        print("[Tripwire] {} view(s) dropped this bake: ".format(len(_dropped_views))
+              + "; ".join("{} at {:.1f}% (best {:.1f}%)".format(*d) for d in _dropped_views))
+        if len(_dropped_views) >= len(images):
+            raise RuntimeError("[Tripwire] every view collapsed -- nothing left to paint with.")
+
+    if _own_i is not None and _os_twc.environ.get("TRELLIS_DUMP_OWNER", "0").strip() == "1":
+        try:
+            from PIL import Image as _PI2
+            _pal = np.array([[255, 80, 80], [80, 160, 255], [80, 255, 120],
+                             [255, 220, 80], [230, 100, 255], [255, 255, 255]], np.uint8)
+            _oi = _own_i.cpu().numpy()
+            _img = np.zeros(_oi.shape + (3,), np.uint8)
+            for _k in range(len(images)):
+                _img[_oi == _k] = _pal[_k % len(_pal)]
+            _op = _os_twc.path.join(_os_twc.path.dirname(_os_twc.path.dirname(
+                _os_twc.path.dirname(_os_twc.path.dirname(_os_twc.path.abspath(__file__))))),
+                "uv_transfer", "_view_owner.png")
+            _PI2.fromarray(_img).save(_op)
+            _leg = "  ".join(f"view{_k}(az={azimuths[_k]:.0f},el={elevations[_k]:.0f})="
+                             f"{('red','blue','green','yellow','magenta','white')[_k % 6]}"
+                             for _k in range(len(images)))
+            print(f"[ViewOwner] wrote _view_owner.png -- {_leg}")
+            for _k in range(len(images)):
+                print(f"[ViewOwner]   view{_k} az={azimuths[_k]:.0f} el={elevations[_k]:.0f} owns "
+                      f"{100.0 * float((_oi == _k).sum()) / max(float((_oi >= 0).sum()), 1):.1f}% of painted texels")
+        except Exception as _oe:
+            print(f"[ViewOwner] failed: {_oe!r}")
+
     print("[MultiView] Finalising texture...")
 
     total_w = acc_weight.sum().item()
@@ -1051,7 +2126,145 @@ def texture_mesh_with_multiview(
             print(f"[DumpStage] {_tag} failed: {_de!r}")
 
     _dump_stage('0_projected')
-    if (not _skip_projection) and fast_skin_fill:
+    # ── COVERAGE REPORT ───────────────────────────────────────────────────────
+    # Principle (user, 2026-09-06): if a surface is not in any image we add an image, we do not
+    # invent one. So say plainly how much was never seen, and where, instead of quietly filling it.
+    _cov_stats = None
+    try:
+        import os as _os_cov
+        _uvn = int(uv_mask_np_bool.sum()); _unc = int(uncovered_uv.sum())
+        _cov_stats = {"total": 100.0 * _unc / max(_uvn, 1)}
+        print(f"[Coverage] {_unc:,} of {_uvn:,} UV texels were seen by NO view "
+              f"({100.0*_unc/max(_uvn,1):.1f}%)")
+        _tp = tex_pos_np if 'tex_pos_np' in dir() else None
+        if _tp is not None:
+            _ax = np.abs(_tp[..., 0])
+            for _nm, _sel in (("arms |x|>0.30", _ax > 0.30),
+                              ("torso+head |x|<=0.30", _ax <= 0.30)):
+                _a = uv_mask_np_bool & _sel; _u = uncovered_uv & _sel
+                if _a.sum():
+                    _cov_stats[_nm.split()[0]] = 100.0 * _u.sum() / _a.sum()
+                    print(f"[Coverage]   {_nm:<22} {int(_u.sum()):>9,} / {int(_a.sum()):>9,} "
+                          f"unseen ({100.0*_u.sum()/_a.sum():.1f}%)")
+            if seam_hair_mask is not None:
+                _a = uv_mask_np_bool & seam_hair_mask; _u = uncovered_uv & seam_hair_mask
+                if _a.sum():
+                    _cov_stats["hair"] = 100.0 * _u.sum() / _a.sum()
+                    print(f"[Coverage]   {'hair':<22} {int(_u.sum()):>9,} / {int(_a.sum()):>9,} "
+                          f"unseen ({100.0*_u.sum()/_a.sum():.1f}%)")
+    except Exception as _cve:
+        print(f"[Coverage] report failed: {_cve!r}")
+
+    # -- COVERAGE TRIPWIRE ----------------------------------------------------
+    # A bake full of holes must FAIL HERE, not sail on through FBX export, eye placement and
+    # rigging to produce a broken asset several minutes later. The primary rule is RELATIVE:
+    # compare against the best coverage this pipeline has ever reached and refuse a run that is
+    # meaningfully worse, so a regression is caught in the bake that introduces it rather than
+    # weeks later. The absolute ceiling is only a catastrophe backstop.
+    #   TRELLIS_COVERAGE_ABORT=0   disable entirely
+    #   TRELLIS_COVERAGE_REGRESS   allowed multiple of the best-ever unseen% (default 1.5)
+    #   TRELLIS_COVERAGE_MAX_PCT   hard ceiling regardless of history (default 15.0)
+    #   TRELLIS_COVERAGE_RESET=1   forget the stored baseline, after an intentional trade-off
+    if (not _skip_projection) and _cov_stats is not None:
+        import os as _os_tw, json as _json_tw, time as _time_tw
+        if _os_tw.environ.get("TRELLIS_COVERAGE_ABORT", "1").strip() != "0":
+            _root = _os_tw.path.dirname(_os_tw.path.dirname(_os_tw.path.dirname(
+                _os_tw.path.dirname(_os_tw.path.abspath(__file__)))))   # -> ComfyUI/
+            _bl_path = _os_tw.path.join(_root, "uv_transfer", "_coverage_baseline.json")
+            _regress = float(_os_tw.environ.get("TRELLIS_COVERAGE_REGRESS", "1.5"))
+            _hardmax = float(_os_tw.environ.get("TRELLIS_COVERAGE_MAX_PCT", "15.0"))
+            _base = None
+            if _os_tw.environ.get("TRELLIS_COVERAGE_RESET", "0").strip() != "1":
+                try:
+                    with open(_bl_path, "r", encoding="utf-8") as _f:
+                        _base = _json_tw.load(_f)
+                except Exception:
+                    _base = None
+            _now = float(_cov_stats["total"])
+            _fail = []
+            if _now > _hardmax:
+                _fail.append("total unseen {:.1f}% exceeds the hard ceiling {:.1f}%".format(
+                    _now, _hardmax))
+            if _base and isinstance(_base.get("total"), (int, float)):
+                _bt = float(_base["total"]); _lim = _bt * _regress
+                print("[Tripwire] unseen {:.2f}%  vs best-ever {:.2f}%  (allowed up to {:.2f}% "
+                      "= {}x)".format(_now, _bt, _lim, _regress))
+                for _k in sorted(_cov_stats):
+                    if _k != "total" and isinstance(_base.get(_k), (int, float)):
+                        print("[Tripwire]   {:<14} {:6.2f}%  (was {:6.2f}%, delta {:+6.2f})".format(
+                            _k, float(_cov_stats[_k]), float(_base[_k]),
+                            float(_cov_stats[_k]) - float(_base[_k])))
+                if _now > _lim:
+                    _fail.append("total unseen {:.1f}% is worse than {}x the best-ever "
+                                 "{:.2f}%".format(_now, _regress, _bt))
+            else:
+                print("[Tripwire] no baseline yet - recording {:.2f}% unseen as the first "
+                      "one".format(_now))
+            if _fail:
+                _worst = max(((_k, float(_v)) for _k, _v in _cov_stats.items() if _k != "total"),
+                             key=lambda kv: kv[1], default=(None, 0.0))
+                _msg = ["[Tripwire] ABORTING BAKE - texture coverage is too poor to ship."]
+                _msg += ["  " + _r for _r in _fail]
+                if _worst[0]:
+                    _msg.append("  worst region: {} at {:.1f}% unseen".format(_worst[0], _worst[1]))
+                _msg.append("  Stopped before FBX export / rigging, so no broken asset is written.")
+                _msg.append("  Baseline file: " + _bl_path)
+                _msg.append("  If this run is an intentional trade-off, re-run once with "
+                            "TRELLIS_COVERAGE_RESET=1, or TRELLIS_COVERAGE_ABORT=0 to disable.")
+                if _os_tw.environ.get("TRELLIS_COVERAGE_HARD", "0").strip() == "1":
+                    raise RuntimeError("\n".join(_msg))
+                # Otherwise WARN and finish. Aborting here throws a completed bake away: generation, mesh
+                # prep and projection are already paid for, and for a NEW character none of it is cached.
+                # An asset you can look at beats nothing after 13 minutes.
+                print("[Tripwire] !! COVERAGE IS POOR: " + "; ".join(_fail)
+                      + " -- continuing so the bake still produces an asset; the baseline is NOT updated."
+                      + " Set TRELLIS_COVERAGE_HARD=1 to abort instead.")
+            if (not _fail) and ((not _base) or _now < float(_base.get("total", 1e9))):
+                try:
+                    _cov_stats["views"] = _tw_views
+                    _cov_stats["_recorded"] = _time_tw.strftime("%Y-%m-%d %H:%M:%S")
+                    with open(_bl_path, "w", encoding="utf-8") as _f:
+                        _json_tw.dump(_cov_stats, _f, indent=2)
+                    print("[Tripwire] new best coverage - baseline updated to {:.2f}% "
+                          "unseen".format(_now))
+                except Exception as _bwe:
+                    print("[Tripwire] could not write baseline: {!r}".format(_bwe))
+
+    import os as _os_fill
+    _FILL_MODE = _os_fill.environ.get("TRELLIS_FILL", "none").strip().lower()
+    if (not _skip_projection) and _FILL_MODE == "none":
+        # NO FILL. Only pixels that a camera actually saw end up on the model. Anything unseen is
+        # left unpainted and MARKED, so the texture itself shows where an image is missing instead
+        # of hiding it behind invented or copied colour. This is what removes the need for a hair
+        # mask entirely: nothing has to guess what a surface "is" in order to colour it.
+        # The marker is opaque on purpose -- seam_bleed pads into alpha==0 regions, so leaving the
+        # gaps transparent would let the padding quietly fill them back in.
+        _mark = _os_fill.environ.get("TRELLIS_MARK_UNCOVERED", "1") != "0"
+        _n_un = int(uncovered_uv.sum())
+        if _mark and _n_un:
+            color_np[uncovered_uv] = np.array([255, 0, 255], dtype=color_np.dtype)
+            alpha_np[uncovered_uv] = 255
+            print(f"  Fill: NONE — {_n_un:,} unseen texels left unpainted and marked MAGENTA "
+                  f"(TRELLIS_MARK_UNCOVERED=0 to leave them transparent)")
+        else:
+            print(f"  Fill: NONE — {_n_un:,} unseen texels left unpainted")
+        _dump_stage('1_no_fill')
+    elif (not _skip_projection) and fast_skin_fill and _FILL_MODE == "geometric":
+        # GEOMETRIC FILL. Every uncovered texel takes the colour of its nearest PROJECTED texel
+        # in 3-D -- a real observed pixel, never an invented one.
+        #
+        # This replaces two fills that were written for the front-image-only era and say so in
+        # their own comments: fill_cylindrical ("front-only ... interpolating the two still-visible
+        # silhouette-edge colours AROUND the body", 523,069 texels last bake) and wrap_arm_front
+        # ("wrap the reliable front-arm colour over the whole arm", 396,700 texels = 33% of the
+        # arms). Both synthesise colour rather than copy it, which is what produced the brown arm
+        # banding; and fill_hair_3d only did the right thing INSIDE the hair mask, so hanging hair
+        # outside that mask (mask floor z=0.093, hair reaches far below) got skin-toned fill --
+        # the pink locks. The 3-D nearest-visible rule needs no class mask at all: hanging hair's
+        # nearest visible neighbour is the hair above it.
+        fu.fill_uncovered_3d(color_np, alpha_np, covered, uncovered_uv)
+        _dump_stage('1_fill_uncovered_3d')
+    elif (not _skip_projection) and fast_skin_fill:
         # ── CYLINDRICAL FILL (front-only): keep the projected front; fill every
         # uncovered (back/side) texel by interpolating the two still-visible
         # silhouette-edge colours AROUND the body, per height band.  Photo-derived,
@@ -1073,7 +2286,7 @@ def texture_mesh_with_multiview(
         # so the browner/darker top+back take the good front tone. GEOMETRY-targeted to the
         # lateral arm region (|x|>0.30) only -> cannot touch the breast/torso, and stable
         # across per-bake meshes (no colour thresholds — the thing that broke the breast).
-        fu.wrap_arm_front(color_np)
+        fu.wrap_arm_front(color_np, covered)
         _dump_stage('2_arm_wrap')
         # SEAM STITCH disabled — reverted to the known-good arm-wrap-only state while we
         # diagnose the upstream UV-unwrap collapse (atlas progressively emptying across
@@ -1157,6 +2370,56 @@ def texture_mesh_with_multiview(
         # NOT the cross-body 3-D fill). Runs before seam_bleed so the outside pad
         # then bleeds the already-closed edge colour.
         fu.fill_interior_seams(color_np, alpha_np)
+    # ── SKIN PAINTED ONTO HAIR ────────────────────────────────────────────────────
+    # A side view paints the ear / the near hand onto HAIR geometry, because the mesh's head and
+    # arm do not sit where the generated image's do. That is a LOCAL mismatch: NCC against the
+    # front view measured the left view as already optimally aligned (gain +0.000), so no global
+    # scale/offset can fix it, and four attempts at one confirmed that the hard way.
+    # Fix it where the knowledge exists instead. gen_seams already flags which faces are hair, so
+    # a hair texel whose colour is closer to the BODY'S OWN SKIN median than to the HAIR median
+    # has been mis-painted. Two medians measured from this character's own atlas -- no threshold,
+    # no assumed hair or skin colour, works for any character.
+    # Only the outliers move; the hair itself is untouched. This is NOT the disabled blanket
+    # recolour above, which flattened all hair to a fixed blonde.
+    try:
+        import os as _os_hs
+        if (seam_hair_mask is not None and _os_hs.environ.get("TRELLIS_HAIR_SKIN_FIX", "1") != "0"):
+            _hairm = seam_hair_mask & uv_mask_np_bool & (alpha_np > 0)
+            _skinm = (~seam_hair_mask) & uv_mask_np_bool & (alpha_np > 0)
+            if int(_hairm.sum()) > 5000 and int(_skinm.sum()) > 5000:
+                _c = color_np.astype(np.float32)
+                _l = _c.sum(axis=2, keepdims=True).clip(min=1.0)
+                _chroma = _c / _l                      # brightness-independent: shading cannot flip it
+                _mh = np.median(_chroma[_hairm], axis=0)
+                _ms = np.median(_chroma[_skinm], axis=0)
+                if float(np.abs(_mh - _ms).sum()) > 1e-3:
+                    _dh = np.linalg.norm(_chroma - _mh[None, None, :], axis=2)
+                    _ds = np.linalg.norm(_chroma - _ms[None, None, :], axis=2)
+                    _wrong = _hairm & (_ds < _dh)      # closer to skin than to hair
+                    _n = int(_wrong.sum())
+                    if _n > 0:
+                        _good = _hairm & ~_wrong
+                        if int(_good.sum()) > 100:
+                            from scipy.spatial import cKDTree as _CK
+                            _gy, _gx = np.where(_good)
+                            if len(_gy) > 400000:
+                                _sel = np.random.default_rng(0).choice(len(_gy), 400000, replace=False)
+                                _gy, _gx = _gy[_sel], _gx[_sel]
+                            _t = _CK(tex_pos_np[_gy, _gx].astype(np.float32))
+                            _wy, _wx = np.where(_wrong)
+                            _, _j = _t.query(tex_pos_np[_wy, _wx].astype(np.float32), k=1, workers=-1)
+                            color_np[_wy, _wx] = color_np[_gy[_j], _gx[_j]]
+                            print(f"  [HairSkinFix] {_n:,} hair texels were closer to skin than to "
+                                  f"hair ({100.0*_n/max(int(_hairm.sum()),1):.1f}% of hair) -- "
+                                  f"repainted from the nearest real hair texel in 3D")
+                        else:
+                            print(f"  [HairSkinFix] {_n:,} suspect texels but too little clean hair "
+                                  f"to source from -- left alone")
+                    else:
+                        print("  [HairSkinFix] no hair texel is closer to skin than to hair -- clean")
+    except Exception as _hse:
+        print(f"  [HairSkinFix] skipped: {_hse!r}")
+
     fu.seam_bleed(color_np, alpha_np)
     fu.colour_correct(color_np, uv_mask_np_bool, saturation_boost, brightness_correction)
     _dump_stage('4_final')
