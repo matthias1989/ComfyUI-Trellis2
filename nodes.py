@@ -1657,9 +1657,12 @@ class Trellis2MeshWithVoxelMultiViewGenerator:
     RETURN_NAMES = ("mesh", "bvh", )
     FUNCTION = "process"
     CATEGORY = "Trellis2Wrapper"
-    OUTPUT_NODE = True
+    # NOT an output node: the Sculpt Cache asks for this draw lazily, only on a miss. As an output node ComfyUI ran
+    # it on EVERY bake anyway, after the rig -- a full Qwen-view + Trellis draw that nothing used (~3 min a
+    # character, and its axis warnings in the log looked like a failed bake; 2026-09-24).
+    OUTPUT_NODE = False
 
-    def process(self, pipeline, front_image, seed, pipeline_type, sparse_structure_steps, 
+    def process(self, pipeline, front_image, seed, pipeline_type, sparse_structure_steps,
         sparse_structure_guidance_strength, 
         sparse_structure_guidance_rescale,
         sparse_structure_rescale_t,
