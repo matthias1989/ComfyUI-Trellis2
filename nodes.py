@@ -1723,8 +1723,99 @@ class Trellis2MeshWithVoxelMultiViewGenerator:
             num_steps = 4
 
         pbar = ProgressBar(num_steps)
-        
-        mesh = pipeline.run_multiview(
+
+        # THE FACE CHECK (2026-09-25, user: option 3 -- "check every new sculpt's face proportions against the photo and
+        # regenerate automatically when they disagree"). Trellis drew 00006 / 00010 / 00011 with mouths 28-43% narrower
+        # than their photos. Each draw's face is measured against the photo (face_check.py: the raw sculpt's head in its own
+        # colours, MediaPipe, the mouth's share of the face width, tolerance 3 x the measurement's noise); a draw that
+        # fails is drawn again with the next seed, up to TRELLIS_FACE_CHECK_TRIES draws; the best one is kept if none
+        # passes. Seeds that drew a wrong face for this photo are remembered and skipped next time. Off:
+        # TRELLIS_FACE_CHECK=0. No widget is added on purpose: a widget would change every cached sculpt's key.
+        _fc_on = os.environ.get("TRELLIS_FACE_CHECK", "1") == "1"
+        _fc_tries = max(1, int(os.environ.get("TRELLIS_FACE_CHECK_TRIES", "4")))
+        _photo_lm, _fc_rec = None, None
+        if _fc_on:
+            try:
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location("trellis2_face_check", os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_check.py"))
+                _fc = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_fc)
+                _photo_lm = _fc.photo_landmarks(front_image)
+                _fc_rec = _fc.load_record(front_image)
+                if _photo_lm is None:
+                    print("[FaceCheck] no face found on the photo -- the draw is not checked")
+            except Exception as _e:
+                print("[FaceCheck] unavailable (%r) -- the draw is not checked" % (_e,))
+                _photo_lm = None
+        _best, _best_dev, _seed_used, _drawn = None, None, None, 0
+        for _k in range(1000):
+            if _drawn >= (_fc_tries if _photo_lm is not None else 1):
+                break
+            _seed = seed + _k
+            if _photo_lm is not None and str(_seed) in _fc_rec.get("rejected", {}):
+                print("[FaceCheck] seed %d drew a wrong face for this photo before -- skipped" % _seed)
+                continue
+            _drawn += 1
+            mesh = self._draw(pipeline, front_pil, back_pil, left_pil, right_pil, _seed, pipeline_type,
+                              sparse_structure_sampler_params, shape_slat_sampler_params, tex_slat_sampler_params,
+                              max_num_tokens, sparse_structure_resolution, generate_texture_slat, use_tiled_decoder,
+                              pbar, front_axis, blend_temperature, sampler, fill_holes, hole_iterations, verbose,
+                              dino_lock, dino_substeps, hole_fill_algorithm, dino_foundation_cap, keep_only_shell)
+            if _photo_lm is None:
+                _best, _seed_used = mesh, _seed
+                break
+            try:
+                _ok, _rep, _ = _fc.check(mesh, _photo_lm)
+            except Exception as _e:
+                _ok, _rep = None, {"error": repr(_e)}
+            _d = _rep.get("deviation", {})
+            print("[FaceCheck] seed %d: %s -- mouth %s, nose %s, eyes %s of the photo's (share of the face width; the "
+                  "mouth decides, +-%.0f%%)" % (_seed, {True: "PASS", False: "FAIL", None: "NOT MEASURED"}[_ok],
+                                                 *("%+.0f%%" % (100 * _d[k]) if k in _d else "?" for k in ("mouth", "nose", "eye")),
+                                                 100 * getattr(_fc, "MOUTH_TOL", 0)))
+            mesh._face_check = dict(_rep, seed=_seed)
+            if _ok is None or _ok:
+                _best, _seed_used = mesh, _seed
+                break
+            _fc_rec.setdefault("rejected", {})[str(_seed)] = _rep
+            _fc.save_record(front_image, _fc_rec)
+            if _best is None or abs(_d["mouth"]) < _best_dev:
+                _best, _best_dev, _seed_used = mesh, abs(_d["mouth"]), _seed
+            else:
+                del mesh
+            torch.cuda.empty_cache()
+        else:
+            pass
+        mesh = _best
+        if _photo_lm is not None and getattr(mesh, "_face_check", {}).get("ok") is False:
+            mesh._face_check["best_of"] = _drawn
+            print("[FaceCheck] *** none of %d draws has her mouth -- keeping the closest (seed %d); raise "
+                  "TRELLIS_FACE_CHECK_TRIES to search further ***" % (_drawn, _seed_used))
+        if _photo_lm is not None:
+            _fc_rec["accepted"] = _seed_used
+            _fc.save_record(front_image, _fc_rec)
+
+        vertices = mesh.vertices.cuda()
+        faces = mesh.faces.cuda()
+
+        if generate_texture_slat:
+            # Build BVH for the current mesh to guide remeshing
+            print("Building BVH for current mesh...")
+            bvh = CuMesh.cuBVH(vertices.detach().clone(), faces.detach().clone())
+            bvh.vertices = vertices.detach().clone()
+            bvh.faces = faces.detach().clone()
+        else:
+            print("Not building BVH : only used for texturing")
+            bvh = None
+
+        return (mesh,bvh,)
+
+    def _draw(self, pipeline, front_pil, back_pil, left_pil, right_pil, seed, pipeline_type,
+              sparse_structure_sampler_params, shape_slat_sampler_params, tex_slat_sampler_params,
+              max_num_tokens, sparse_structure_resolution, generate_texture_slat, use_tiled_decoder,
+              pbar, front_axis, blend_temperature, sampler, fill_holes, hole_iterations, verbose,
+              dino_lock, dino_substeps, hole_fill_algorithm, dino_foundation_cap, keep_only_shell):
+        """One Trellis draw (the call process() always made)."""
+        return pipeline.run_multiview(
             front=front_pil,
             back=back_pil,
             left=left_pil,
@@ -1750,22 +1841,7 @@ class Trellis2MeshWithVoxelMultiViewGenerator:
             hole_fill_algorithm=hole_fill_algorithm,
             dino_foundation_cap=dino_foundation_cap,
             keep_only_shell=keep_only_shell
-        )[0]         
-        
-        vertices = mesh.vertices.cuda()
-        faces = mesh.faces.cuda()                
-        
-        if generate_texture_slat:
-            # Build BVH for the current mesh to guide remeshing
-            print("Building BVH for current mesh...")
-            bvh = CuMesh.cuBVH(vertices.detach().clone(), faces.detach().clone())           
-            bvh.vertices = vertices.detach().clone()
-            bvh.faces = faces.detach().clone()
-        else:
-            print("Not building BVH : only used for texturing")
-            bvh = None
-        
-        return (mesh,bvh,)
+        )[0]
 
 class Trellis2PostProcessAndUnWrapAndRasterizer:
     @classmethod
